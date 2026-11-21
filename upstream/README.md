@@ -7,7 +7,7 @@ That's what `nix/` builds and the VM tests run.
 | Directory | For | Contents |
 |---|---|---|
 | `fixes/` | linux-usb, stable | Two DbC core fixes: rings that fill after one lap (`Fixes: 7ee645963075`), and a request leak when DbC is disabled (`Fixes: efe3e3ae5a66`) |
-| `dbc-net/` | linux-usb, RFC | On top of the fixes: a `remove` op, ttyDBC under its own Kconfig option, then `dbc_net`, which asks for a product ID (0012 provisional) |
+| `dbc-net/` | linux-usb, RFC | On top of the fixes: a `remove` op, ttyDBC under its own Kconfig option, `dbc_net` (which asks for a product ID, 0012 provisional), and its documentation in `usb3-debug-port.rst` and the `dbc_idProduct` ABI entry |
 | `dbcnet-host/` | netdev, RFC | The debug host's usbnet driver, `drivers/net/usb/dbcnet.c` |
 
 How they're checked:
@@ -25,7 +25,10 @@ How they're checked:
   `kzalloc_obj()` variant; the tests load `kmod/dbcnet.c`, which differs
   from it only in that allocation.
 - **Each step of the series builds on its own,** on both bases.
-- **checkpatch (7.4-rc3)** has no errors. The remaining warnings are:
+- **checkpatch (7.4-rc3)** reports one error per patch, "Missing
+  Signed-off-by", which is deliberate (see below); your sign-off clears
+  it. The documentation is valid reStructuredText (docutils). The
+  remaining warnings are:
   - the `Co-Authored-By` trailers;
   - MAINTAINERS for the two new files;
   - "unknown commit id", only because it ran without a git tree. Both

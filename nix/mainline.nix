@@ -12,9 +12,13 @@ let
   dbcPatches = import ./mainline-patches.nix;
 in
 linkFarm "dbc-mainline" {
+  # The full tree also takes the documentation patch, which the module
+  # builds, having only drivers/usb/host, cannot.
   kconfig-split = callPackage ./kconfig-split.nix {
     linux = linux_testing;
-    inherit dbcPatches;
+    dbcPatches = dbcPatches ++ [
+      ../upstream/dbc-net/0004-Documentation-usb-describe-dbc_net-the-DbC-network-f.patch
+    ];
     hostPatch = ../upstream/dbcnet-host/0001-net-usb-add-dbcnet-the-debug-host-s-end-of-a-DbC-net.patch;
   };
   xhci-hcd-dbc = linuxPackages_testing.callPackage ./xhci-hcd-dbc.nix { inherit dbcPatches; };

@@ -1,7 +1,7 @@
 From 7bdcec830bf6f7bb9b4e59c4575a297132aa223d Mon Sep 17 00:00:00 2001
 From: Josh Hoffer <jhoffer@sansorgan.es>
 Date: Sat, 21 Nov 2026 13:09:11 -0800
-Subject: [RFC PATCH 3/3] usb: xhci: dbc: add a network function, dbc_net
+Subject: [RFC PATCH 3/4] usb: xhci: dbc: add a network function, dbc_net
 
 The debug capability can only be a TTY, ttyDBC. That gives a link
 between two ordinary PCs over a USB 3 debug cable, with no device

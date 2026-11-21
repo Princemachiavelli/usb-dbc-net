@@ -1,7 +1,7 @@
 From 5772b715fe9f0cea083fe193d09d74efbd224ff5 Mon Sep 17 00:00:00 2001
 From: Josh Hoffer <jhoffer@sansorgan.es>
 Date: Sat, 21 Nov 2026 13:09:03 -0800
-Subject: [RFC PATCH 2/3] usb: xhci: dbc: give ttyDBC its own Kconfig option
+Subject: [RFC PATCH 2/4] usb: xhci: dbc: give ttyDBC its own Kconfig option
 
 The debug capability and its tty function share one option,
 USB_XHCI_DBGCAP, so DbC cannot be built without ttyDBC. Move the tty

@@ -1,0 +1,102 @@
+From 7c7f4a8575880bf0acb6726431d366e01bf718dd Mon Sep 17 00:00:00 2001
+From: Josh Hoffer <jhoffer@sansorgan.es>
+Date: Sat, 21 Nov 2026 14:07:36 -0800
+Subject: [RFC PATCH 4/4] Documentation: usb: describe dbc_net, the DbC network
+ function
+
+Describe the network function the previous patch adds:
+- what it needs: USB_XHCI_DBGCAP_NET;
+- the dbc_net parameter that picks it when ttyDBC is built too;
+- the interfaces at both ends and its USB identity;
+- the framing, for debug hosts without the dbcnet driver.
+
+Note that the TTY function now needs USB_XHCI_DBGCAP_TTY, and give the
+network function's default product ID in the ABI entry for
+dbc_idProduct.
+
+Written, with this changelog, by Claude Opus 5.5, an AI coding assistant.
+See the cover letter for how it was made and tested.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../testing/sysfs-bus-pci-drivers-xhci_hcd    |  3 +-
+ .../driver-api/usb/usb3-debug-port.rst        | 45 +++++++++++++++++--
+ 2 files changed, 44 insertions(+), 4 deletions(-)
+
+diff --git a/Documentation/ABI/testing/sysfs-bus-pci-drivers-xhci_hcd b/Documentation/ABI/testing/sysfs-bus-pci-drivers-xhci_hcd
+index 991765d..7c570a4 100644
+--- a/Documentation/ABI/testing/sysfs-bus-pci-drivers-xhci_hcd
++++ b/Documentation/ABI/testing/sysfs-bus-pci-drivers-xhci_hcd
+@@ -47,7 +47,8 @@ Description:
+ 		Value can only be changed while debug capability (DbC) is in
+ 		disabled state to prevent USB device descriptor change while
+ 		connected to a USB host.
+-		The default value is 0x0010. It can be any 16-bit integer.
++		The default value is 0x0010, or 0x0012 for the network
++		function, dbc_net. It can be any 16-bit integer.
+ 
+ What:		/sys/bus/pci/drivers/xhci_hcd/.../dbc_bcdDevice
+ Date:		March 2023
+diff --git a/Documentation/driver-api/usb/usb3-debug-port.rst b/Documentation/driver-api/usb/usb3-debug-port.rst
+index d461045..e9d4de1 100644
+--- a/Documentation/driver-api/usb/usb3-debug-port.rst
++++ b/Documentation/driver-api/usb/usb3-debug-port.rst
+@@ -106,9 +106,9 @@ The DbC support has been added to the xHCI driver. You can get a
+ debug device provided by the DbC at runtime.
+ 
+ In order to use this, you need to make sure your kernel has been
+-configured to support USB_XHCI_DBGCAP. A sysfs attribute under
+-the xHCI device node is used to enable or disable DbC. By default,
+-DbC is disabled::
++configured to support USB_XHCI_DBGCAP and USB_XHCI_DBGCAP_TTY. A sysfs
++attribute under the xHCI device node is used to enable or disable DbC.
++By default, DbC is disabled::
+ 
+ 	root@target:/sys/bus/pci/devices/0000:00:14.0# cat dbc
+ 	disabled
+@@ -150,3 +150,42 @@ You will see below kernel message lines::
+ 
+ The debug device works now. You can use any communication or debugging
+ program to talk between the host and the target.
++
++Network Interface
++=================
++
++Instead of a TTY, DbC can present a network interface, dbcN, that carries
++raw IP packets between the target and the debug host. This needs
++USB_XHCI_DBGCAP_NET. A kernel built without USB_XHCI_DBGCAP_TTY has only
++this function, and needs no TTY layer for DbC.
++
++When both functions are built, the xhci_hcd.dbc_net module parameter
++picks one. It is read when a controller is set up, so set it before the
++controller binds, or rebind it afterwards::
++
++	root@target: echo 1 > /sys/module/xhci_hcd/parameters/dbc_net
++	root@target: echo 0000:00:14.0 > /sys/bus/pci/drivers/xhci_hcd/unbind
++	root@target: echo 0000:00:14.0 > /sys/bus/pci/drivers/xhci_hcd/bind
++
++Enable DbC with the dbc attribute, as for the TTY. The interface has
++carrier while DbC is configured::
++
++	root@target: ip addr add 192.168.77.1/24 dev dbc0
++	root@target: ip link set dbc0 up
++
++The debug device enumerates on the debug host as idVendor=1d6b,
++idProduct=0012, so that the debug host can tell it from ttyDBC. There,
++the dbcnet driver (USB_NET_DBCNET) binds it and presents an interface of
++its own::
++
++	root@host: ip addr add 192.168.77.2/24 dev dbc0
++	root@host: ip link set dbc0 up
++	root@host: ping 192.168.77.1
++
++Each end defaults to an MTU of 1500, and can go up to 65528 bytes on the
++target. Each packet is framed with a 4-byte header: the magic 0xdb5e and
++the payload length, both big-endian. Frames form a byte stream in each
++direction; transfer boundaries carry no meaning. A debug host without
++dbcnet can implement this in userspace, for example with libusb. It must
++end each transfer whose length is a multiple of the endpoint's maximum
++packet size with a zero-length packet.
+-- 
+2.56.0
+
