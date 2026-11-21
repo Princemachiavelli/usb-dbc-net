@@ -1,0 +1,734 @@
+From 0c6061d5917b2976b6a13e6197648335c9777008 Mon Sep 17 00:00:00 2001
+From: Josh Hoffer <jhoffer@sansorgan.es>
+Date: Sat, 21 Nov 2026 10:39:28 -0800
+Subject: [RFC PATCH 2/2] usb: xhci: dbc: add a network function, dbc_net
+
+The debug capability can only be a TTY, ttyDBC. That gives a link
+between two ordinary PCs over a USB 3 debug cable, with no device
+controller on either side, but at tty speeds. IP over ttyDBC with
+pppd manages well under 100 Mb/s, and loses packets.
+
+Add a second function, dbc_net, which presents the DbC as a raw IP
+network interface, dbcN. On the wire each IP packet gets a 4-byte header
+(magic 0xdb5e, then the length, both big-endian), and the packets form a
+byte stream in each direction:
+
+- Transmit copies packets into 64 KiB buffers, batching while the stack
+  has more queued, with up to three transfers in flight. The copy fills
+  in checksums, so the interface offers HW_CSUM and SG. DbC cannot send
+  a zero-length packet, so a transfer that would end on a packet
+  boundary gets an empty frame appended.
+- Receive keeps eight 64 KiB requests queued. Completions, which arrive
+  with interrupts off, hand the request to NAPI, which decodes, passes
+  packets to GRO and requeues.
+- The interface lives as long as the controller does; DbC state only
+  sets its carrier.
+
+dbc_net sets bInterfaceProtocol to 0 (vendor defined), where ttyDBC uses
+1, so the debug host can tell the two apart.
+
+The tty function moves under its own option, USB_XHCI_DBGCAP_TTY,
+default y, so existing configs keep ttyDBC; USB_XHCI_DBGCAP_NET is the
+new one. USB_XHCI_DBGCAP then needs only TTY or NET, and a kernel
+without the tty layer can have DbC for the first time. With both
+functions built, the dbc_net module parameter picks one when a
+controller is set up.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Signed-off-by: Josh Hoffer <jhoffer@sansorgan.es>
+---
+ drivers/usb/host/Kconfig       |  28 +-
+ drivers/usb/host/Makefile      |   4 +-
+ drivers/usb/host/xhci-dbgcap.c |  24 +-
+ drivers/usb/host/xhci-dbgcap.h |   1 +
+ drivers/usb/host/xhci-dbgnet.c | 559 +++++++++++++++++++++++++++++++++
+ 5 files changed, 608 insertions(+), 8 deletions(-)
+ create mode 100644 drivers/usb/host/xhci-dbgnet.c
+
+diff --git a/drivers/usb/host/Kconfig b/drivers/usb/host/Kconfig
+index 87103b8..ae756a8 100644
+--- a/drivers/usb/host/Kconfig
++++ b/drivers/usb/host/Kconfig
+@@ -30,12 +30,32 @@ config USB_XHCI_HCD
+ if USB_XHCI_HCD
+ config USB_XHCI_DBGCAP
+ 	bool "xHCI support for debug capability"
+-	depends on TTY
++	depends on TTY || NET
+ 	help
+ 	  Say 'Y' to enable the support for the xHCI debug capability. Make
+-	  sure that your xHCI host supports the extended debug capability and
+-	  you want a TTY serial device based on the xHCI debug capability
+-	  before enabling this option. If unsure, say 'N'.
++	  sure that your xHCI host supports the extended debug capability,
++	  and choose what it presents to the debug host below. If unsure,
++	  say 'N'.
++
++config USB_XHCI_DBGCAP_TTY
++	bool "Debug capability as a TTY serial device (ttyDBC)"
++	depends on USB_XHCI_DBGCAP && TTY
++	default y
++	help
++	  The debug capability presents a TTY serial device, ttyDBC, with
++	  interface protocol 1 (GNU remote debug). On the debug host, the
++	  usb_debug serial driver binds it as ttyUSB. This was the debug
++	  capability's only function before USB_XHCI_DBGCAP_NET, so it
++	  defaults to on.
++
++config USB_XHCI_DBGCAP_NET
++	bool "Debug capability as a network interface (dbc_net)"
++	depends on USB_XHCI_DBGCAP && NET
++	help
++	  The debug capability presents a raw IP network interface, dbcN,
++	  with interface protocol 0 (vendor defined). With the TTY function
++	  built too, the xhci_hcd.dbc_net parameter picks between them;
++	  without it, this is the only function and needs no TTY layer.
+ 
+ config USB_XHCI_PCI
+ 	tristate
+diff --git a/drivers/usb/host/Makefile b/drivers/usb/host/Makefile
+index 4df946c..2a1017c 100644
+--- a/drivers/usb/host/Makefile
++++ b/drivers/usb/host/Makefile
+@@ -16,7 +16,9 @@ xhci-hcd-y += xhci-ring.o xhci-hub.o xhci-dbg.o
+ xhci-hcd-y += xhci-trace.o
+ 
+ ifneq ($(CONFIG_USB_XHCI_DBGCAP), )
+-	xhci-hcd-y += xhci-dbgcap.o xhci-dbgtty.o
++	xhci-hcd-y += xhci-dbgcap.o
++	xhci-hcd-$(CONFIG_USB_XHCI_DBGCAP_TTY) += xhci-dbgtty.o
++	xhci-hcd-$(CONFIG_USB_XHCI_DBGCAP_NET) += xhci-dbgnet.o
+ endif
+ 
+ xhci-mtk-hcd-y := xhci-mtk.o xhci-mtk-sch.o
+diff --git a/drivers/usb/host/xhci-dbgcap.c b/drivers/usb/host/xhci-dbgcap.c
+index 4945b51..93fcfef 100644
+--- a/drivers/usb/host/xhci-dbgcap.c
++++ b/drivers/usb/host/xhci-dbgcap.c
+@@ -29,6 +29,16 @@
+ #include "xhci-trace.h"
+ #include "xhci-dbgcap.h"
+ 
++#if IS_ENABLED(CONFIG_USB_XHCI_DBGCAP_TTY) && IS_ENABLED(CONFIG_USB_XHCI_DBGCAP_NET)
++static bool dbc_net;
++module_param(dbc_net, bool, 0644);
++MODULE_PARM_DESC(dbc_net,
++	"DbC presents a network interface (dbcN) instead of ttyDBC; read when a controller is set up");
++#else
++/* With one function built, that is the one. */
++static const bool dbc_net = IS_ENABLED(CONFIG_USB_XHCI_DBGCAP_NET);
++#endif
++
+ static void dbc_free_ctx(struct device *dev, struct xhci_container_ctx *ctx)
+ {
+ 	if (!ctx)
+@@ -1372,7 +1382,12 @@ int xhci_create_dbc_dev(struct xhci_hcd *xhci)
+ 	if (xhci->dbc)
+ 		return -EBUSY;
+ 
+-	ret = xhci_dbc_tty_probe(dev, base + dbc_cap_offs, xhci);
++	if (dbc_net)
++		ret = xhci_dbc_net_probe(dev, base + dbc_cap_offs, xhci);
++	else if (IS_ENABLED(CONFIG_USB_XHCI_DBGCAP_TTY))
++		ret = xhci_dbc_tty_probe(dev, base + dbc_cap_offs, xhci);
++	else
++		ret = -ENODEV;
+ 
+ 	return ret;
+ }
+@@ -1433,10 +1448,13 @@ int xhci_dbc_resume(struct xhci_hcd *xhci)
+ 
+ int xhci_dbc_init(void)
+ {
+-	return dbc_tty_init();
++	if (IS_ENABLED(CONFIG_USB_XHCI_DBGCAP_TTY))
++		return dbc_tty_init();
++	return 0;
+ }
+ 
+ void xhci_dbc_exit(void)
+ {
+-	dbc_tty_exit();
++	if (IS_ENABLED(CONFIG_USB_XHCI_DBGCAP_TTY))
++		dbc_tty_exit();
+ }
+diff --git a/drivers/usb/host/xhci-dbgcap.h b/drivers/usb/host/xhci-dbgcap.h
+index 0e717a3..298d7f8 100644
+--- a/drivers/usb/host/xhci-dbgcap.h
++++ b/drivers/usb/host/xhci-dbgcap.h
+@@ -216,6 +216,7 @@ int dbc_tty_init(void);
+ void dbc_tty_exit(void);
+ int xhci_dbc_tty_probe(struct device *dev, void __iomem *res, struct xhci_hcd *xhci);
+ void xhci_dbc_tty_remove(struct xhci_dbc *dbc);
++int xhci_dbc_net_probe(struct device *dev, void __iomem *base, struct xhci_hcd *xhci);
+ struct xhci_dbc *xhci_alloc_dbc(struct device *dev, void __iomem *res,
+ 				 const struct dbc_driver *driver);
+ void xhci_dbc_remove(struct xhci_dbc *dbc);
+diff --git a/drivers/usb/host/xhci-dbgnet.c b/drivers/usb/host/xhci-dbgnet.c
+new file mode 100644
+index 0000000..29a76aa
+--- /dev/null
++++ b/drivers/usb/host/xhci-dbgnet.c
+@@ -0,0 +1,559 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * xhci-dbgnet.c - a network interface over the xHCI debug capability
++ *
++ * The DbC gives a debug host one bulk endpoint pair. This function carries
++ * IP packets over it in place of ttyDBC. Each packet is framed with a 4-byte
++ * header, a magic 0xdb5e and the payload length, both big-endian. The frames
++ * form a byte stream in each direction: a transfer may hold many frames or
++ * part of one, so transfer boundaries carry no meaning, and a receiver that
++ * loses sync skips bytes until the magic reappears.
++ *
++ * Outgoing frames are batched into transfers of up to 64 KiB. The DbC cannot
++ * send a zero-length packet, so a transfer that would end on a packet
++ * boundary gets an empty frame appended, which the receiver skips; the debug
++ * host's read then ends on a short packet. In the other direction the debug
++ * host must end such a transfer with a zero-length packet, since our 64 KiB
++ * receive TRBs complete only when full or short.
++ */
++#include <linux/if_arp.h>
++#include <linux/netdevice.h>
++#include <linux/rtnetlink.h>
++#include <linux/skbuff.h>
++#include <linux/slab.h>
++#include <linux/unaligned.h>
++
++#include "xhci.h"
++#include "xhci-dbgcap.h"
++
++/*
++ * bInterfaceProtocol 0 is vendor defined; ttyDBC uses 1 (GNU Remote Debug).
++ * It lets a debug host tell this function from the tty.
++ */
++#define DBC_NET_PROTOCOL	0
++#define DBC_NET_MAGIC		0xdb5e
++#define DBC_NET_HDR		4
++/* One TRB at most: a naturally aligned 64 KiB buffer crosses no 64 KiB line. */
++#define DBC_NET_BUF_SIZE	SZ_64K
++#define DBC_NET_MAX_MTU		(DBC_NET_BUF_SIZE - 2 * DBC_NET_HDR)
++#define DBC_NET_RX_REQS		8
++#define DBC_NET_TX_REQS		4
++/* The last TX buffer fills while the others are in flight. */
++#define DBC_NET_TX_INFLIGHT	(DBC_NET_TX_REQS - 1)
++
++struct dbc_net {
++	struct xhci_dbc		*dbc;
++	struct net_device	*ndev;
++	struct napi_struct	napi;
++
++	struct dbc_request	*rx_reqs[DBC_NET_RX_REQS];
++	spinlock_t		rx_lock;	/* rx_done, rx_on */
++	struct list_head	rx_done;	/* completed, waiting for NAPI */
++	bool			rx_on;
++
++	/* Stream decoder state, used by NAPI only: */
++	u8			hdr[DBC_NET_HDR];
++	unsigned int		hdr_len;
++	unsigned int		need;		/* payload bytes still to come */
++	struct sk_buff		*skb;		/* NULL while discarding */
++
++	struct dbc_request	*tx_reqs[DBC_NET_TX_REQS];
++	spinlock_t		tx_lock;	/* everything below */
++	struct list_head	tx_pool;
++	struct dbc_request	*tx_cur;	/* filling; ->length is its fill */
++	unsigned int		tx_inflight;
++	bool			tx_on;
++};
++
++static void dbc_net_rx_reset(struct dbc_net *net)
++{
++	dev_kfree_skb_any(net->skb);
++	net->skb = NULL;
++	net->hdr_len = 0;
++	net->need = 0;
++}
++
++static void dbc_net_deliver(struct dbc_net *net)
++{
++	struct net_device	*ndev = net->ndev;
++	struct sk_buff		*skb = net->skb;
++
++	net->skb = NULL;
++
++	switch (skb->data[0] >> 4) {
++	case 4:
++		skb->protocol = htons(ETH_P_IP);
++		break;
++	case 6:
++		skb->protocol = htons(ETH_P_IPV6);
++		break;
++	default:
++		ndev->stats.rx_errors++;
++		dev_kfree_skb_any(skb);
++		return;
++	}
++
++	skb_reset_mac_header(skb);
++	skb_reset_network_header(skb);
++	skb->dev = ndev;
++	ndev->stats.rx_packets++;
++	ndev->stats.rx_bytes += skb->len;
++	napi_gro_receive(&net->napi, skb);
++}
++
++/* Feeds received bytes to the stream decoder; returns frames delivered. */
++static int dbc_net_decode(struct dbc_net *net, const u8 *p, unsigned int len)
++{
++	struct net_device	*ndev = net->ndev;
++	unsigned int		n;
++	int			frames = 0;
++
++	while (len) {
++		if (net->need) {
++			n = min(len, net->need);
++			if (net->skb)
++				skb_put_data(net->skb, p, n);
++			p += n;
++			len -= n;
++			net->need -= n;
++			if (!net->need && net->skb) {
++				dbc_net_deliver(net);
++				frames++;
++			}
++			continue;
++		}
++
++		net->hdr[net->hdr_len++] = *p++;
++		len--;
++		if (net->hdr_len < DBC_NET_HDR)
++			continue;
++
++		if (get_unaligned_be16(net->hdr) != DBC_NET_MAGIC) {
++			/* Out of sync: slide by one byte and look again. */
++			memmove(net->hdr, net->hdr + 1, DBC_NET_HDR - 1);
++			net->hdr_len--;
++			ndev->stats.rx_frame_errors++;
++			continue;
++		}
++
++		net->hdr_len = 0;
++		net->need = get_unaligned_be16(net->hdr + 2);
++		/* An empty frame is padding. */
++		if (!net->need)
++			continue;
++		net->skb = napi_alloc_skb(&net->napi, net->need);
++		if (!net->skb)
++			ndev->stats.rx_dropped++;
++	}
++
++	return frames;
++}
++
++static void dbc_net_rx_queue(struct dbc_net *net, struct dbc_request *req)
++{
++	unsigned long		flags;
++
++	spin_lock_irqsave(&net->rx_lock, flags);
++	req->length = DBC_NET_BUF_SIZE;
++	/* Off, or failed: the request waits for the next configure. */
++	if (net->rx_on && dbc_ep_queue(req))
++		net->ndev->stats.rx_errors++;
++	spin_unlock_irqrestore(&net->rx_lock, flags);
++}
++
++static int dbc_net_poll(struct napi_struct *napi, int budget)
++{
++	struct dbc_net		*net = container_of(napi, struct dbc_net, napi);
++	struct dbc_request	*req;
++	int			work = 0;
++
++	while (work < budget) {
++		spin_lock_irq(&net->rx_lock);
++		req = list_first_entry_or_null(&net->rx_done,
++					       struct dbc_request, list_pool);
++		if (req)
++			list_del_init(&req->list_pool);
++		spin_unlock_irq(&net->rx_lock);
++		if (!req)
++			break;
++
++		work += dbc_net_decode(net, req->buf, req->actual);
++		dbc_net_rx_queue(net, req);
++	}
++
++	if (work < budget) {
++		napi_complete_done(napi, work);
++		return work;
++	}
++
++	return budget;
++}
++
++static void dbc_net_rx_complete(struct xhci_dbc *dbc, struct dbc_request *req)
++{
++	struct dbc_net		*net = dbc->priv;
++	unsigned long		flags;
++
++	if (req->status == -ESHUTDOWN)
++		return;
++	if (req->status)
++		net->ndev->stats.rx_errors++;
++
++	/* Called with interrupts off: leave the stack's work to NAPI. */
++	spin_lock_irqsave(&net->rx_lock, flags);
++	if (net->rx_on) {
++		list_add_tail(&req->list_pool, &net->rx_done);
++		napi_schedule(&net->napi);
++	}
++	spin_unlock_irqrestore(&net->rx_lock, flags);
++}
++
++/* Queues the buffer being filled. Called with tx_lock held. */
++static void dbc_net_tx_submit(struct dbc_net *net)
++{
++	struct dbc_request	*req = net->tx_cur;
++
++	if (!req || !req->length || net->tx_inflight >= DBC_NET_TX_INFLIGHT)
++		return;
++
++	/* No ZLP from the DbC: end on a short packet instead. */
++	if (req->length % DBC_MAX_PACKET == 0) {
++		put_unaligned_be16(DBC_NET_MAGIC, req->buf + req->length);
++		put_unaligned_be16(0, req->buf + req->length + 2);
++		req->length += DBC_NET_HDR;
++	}
++
++	net->tx_cur = NULL;
++	if (dbc_ep_queue(req)) {
++		net->ndev->stats.tx_errors++;
++		req->length = 0;
++		list_add_tail(&req->list_pool, &net->tx_pool);
++		return;
++	}
++	net->tx_inflight++;
++}
++
++static bool dbc_net_tx_room(struct dbc_net *net, unsigned int frame)
++{
++	struct dbc_request	*req = net->tx_cur;
++
++	/* Room for the frame and a padding header. */
++	return !req || req->length + frame + DBC_NET_HDR <= DBC_NET_BUF_SIZE;
++}
++
++static void dbc_net_tx_complete(struct xhci_dbc *dbc, struct dbc_request *req)
++{
++	struct dbc_net		*net = dbc->priv;
++	unsigned long		flags;
++
++	if (req->status == -ESHUTDOWN)
++		return;
++
++	spin_lock_irqsave(&net->tx_lock, flags);
++	if (req->status)
++		net->ndev->stats.tx_errors++;
++	req->length = 0;
++	list_add_tail(&req->list_pool, &net->tx_pool);
++	net->tx_inflight--;
++	if (net->tx_on) {
++		/* What queued up meanwhile goes out as one transfer. */
++		dbc_net_tx_submit(net);
++		netif_wake_queue(net->ndev);
++	}
++	spin_unlock_irqrestore(&net->tx_lock, flags);
++}
++
++static netdev_tx_t dbc_net_xmit(struct sk_buff *skb, struct net_device *ndev)
++{
++	struct dbc_net		*net = netdev_priv(ndev);
++	unsigned int		frame = DBC_NET_HDR + skb->len;
++	unsigned int		max = DBC_NET_HDR + READ_ONCE(ndev->mtu);
++	struct dbc_request	*req;
++	unsigned long		flags;
++	u8			*p;
++
++	spin_lock_irqsave(&net->tx_lock, flags);
++
++	if (!net->tx_on || skb->len > DBC_NET_MAX_MTU)
++		goto out_drop;
++
++	if (!dbc_net_tx_room(net, frame))
++		dbc_net_tx_submit(net);
++	if (!dbc_net_tx_room(net, frame))
++		goto out_busy;
++
++	req = net->tx_cur;
++	if (!req) {
++		req = list_first_entry_or_null(&net->tx_pool,
++					       struct dbc_request, list_pool);
++		if (!req)
++			goto out_busy;
++		list_del_init(&req->list_pool);
++		req->length = 0;
++		net->tx_cur = req;
++	}
++
++	p = req->buf + req->length;
++	put_unaligned_be16(DBC_NET_MAGIC, p);
++	put_unaligned_be16(skb->len, p + 2);
++	/* Copying anyway, so fill in a partial checksum on the way. */
++	skb_copy_and_csum_dev(skb, p + DBC_NET_HDR);
++	req->length += frame;
++	ndev->stats.tx_packets++;
++	ndev->stats.tx_bytes += skb->len;
++
++	/* Batch while the stack has more for us or the pipe is busy. */
++	if (!netdev_xmit_more() || !dbc_net_tx_room(net, max))
++		dbc_net_tx_submit(net);
++
++	if (!dbc_net_tx_room(net, max) ||
++	    (!net->tx_cur && list_empty(&net->tx_pool)))
++		netif_stop_queue(ndev);
++
++	spin_unlock_irqrestore(&net->tx_lock, flags);
++	dev_consume_skb_any(skb);
++	return NETDEV_TX_OK;
++
++out_drop:
++	ndev->stats.tx_dropped++;
++	spin_unlock_irqrestore(&net->tx_lock, flags);
++	dev_kfree_skb_any(skb);
++	return NETDEV_TX_OK;
++
++out_busy:
++	netif_stop_queue(ndev);
++	spin_unlock_irqrestore(&net->tx_lock, flags);
++	return NETDEV_TX_BUSY;
++}
++
++static int dbc_net_open(struct net_device *ndev)
++{
++	struct dbc_net		*net = netdev_priv(ndev);
++
++	napi_enable(&net->napi);
++	/* Drain what arrived while the interface was down. */
++	napi_schedule(&net->napi);
++	netif_start_queue(ndev);
++
++	return 0;
++}
++
++static int dbc_net_stop(struct net_device *ndev)
++{
++	struct dbc_net		*net = netdev_priv(ndev);
++
++	netif_stop_queue(ndev);
++	napi_disable(&net->napi);
++
++	return 0;
++}
++
++static const struct net_device_ops dbc_net_ops = {
++	.ndo_open		= dbc_net_open,
++	.ndo_stop		= dbc_net_stop,
++	.ndo_start_xmit		= dbc_net_xmit,
++};
++
++static void dbc_net_setup(struct net_device *ndev)
++{
++	ndev->netdev_ops	= &dbc_net_ops;
++	ndev->type		= ARPHRD_NONE;
++	ndev->flags		= IFF_POINTOPOINT | IFF_NOARP | IFF_MULTICAST;
++	ndev->hard_header_len	= 0;
++	ndev->addr_len		= 0;
++	ndev->mtu		= ETH_DATA_LEN;
++	ndev->min_mtu		= ETH_MIN_MTU;
++	ndev->max_mtu		= DBC_NET_MAX_MTU;
++	ndev->tx_queue_len	= 1000;
++	ndev->features		= NETIF_F_SG | NETIF_F_HW_CSUM | NETIF_F_HIGHDMA;
++	ndev->hw_features	= ndev->features;
++}
++
++/*
++ * Both callbacks run from the DbC event work, outside the DbC lock. The
++ * core has given back every queued request before a disconnect, and a
++ * configure follows fresh rings, so each one starts the pools over.
++ */
++static int dbc_net_configure(struct xhci_dbc *dbc)
++{
++	struct dbc_net		*net = dbc->priv;
++	struct net_device	*ndev = net->ndev;
++	bool			running;
++	int			i;
++
++	rtnl_lock();
++	running = netif_running(ndev);
++	if (running)
++		napi_disable(&net->napi);
++
++	dbc_net_rx_reset(net);
++	spin_lock_irq(&net->rx_lock);
++	INIT_LIST_HEAD(&net->rx_done);
++	net->rx_on = true;
++	spin_unlock_irq(&net->rx_lock);
++	for (i = 0; i < DBC_NET_RX_REQS; i++)
++		dbc_net_rx_queue(net, net->rx_reqs[i]);
++
++	spin_lock_irq(&net->tx_lock);
++	INIT_LIST_HEAD(&net->tx_pool);
++	for (i = 0; i < DBC_NET_TX_REQS; i++) {
++		net->tx_reqs[i]->length = 0;
++		list_add_tail(&net->tx_reqs[i]->list_pool, &net->tx_pool);
++	}
++	net->tx_cur = NULL;
++	net->tx_inflight = 0;
++	net->tx_on = true;
++	spin_unlock_irq(&net->tx_lock);
++
++	if (running)
++		napi_enable(&net->napi);
++	if (ndev->reg_state == NETREG_REGISTERED) {
++		netif_carrier_on(ndev);
++		netif_wake_queue(ndev);
++	}
++	rtnl_unlock();
++
++	return 0;
++}
++
++static void dbc_net_disconnect(struct xhci_dbc *dbc)
++{
++	struct dbc_net		*net = dbc->priv;
++	struct net_device	*ndev = net->ndev;
++	bool			running;
++
++	rtnl_lock();
++	if (ndev->reg_state == NETREG_REGISTERED)
++		netif_carrier_off(ndev);
++
++	spin_lock_irq(&net->tx_lock);
++	net->tx_on = false;
++	spin_unlock_irq(&net->tx_lock);
++
++	running = netif_running(ndev);
++	if (running)
++		napi_disable(&net->napi);
++	spin_lock_irq(&net->rx_lock);
++	net->rx_on = false;
++	INIT_LIST_HEAD(&net->rx_done);
++	spin_unlock_irq(&net->rx_lock);
++	dbc_net_rx_reset(net);
++	if (running)
++		napi_enable(&net->napi);
++	rtnl_unlock();
++}
++
++static void dbc_net_free_requests(struct dbc_request **reqs, int n)
++{
++	int			i;
++
++	for (i = 0; i < n; i++) {
++		if (!reqs[i])
++			continue;
++		kfree(reqs[i]->buf);
++		dbc_free_request(reqs[i]);
++		reqs[i] = NULL;
++	}
++}
++
++static int dbc_net_alloc_requests(struct xhci_dbc *dbc, unsigned int direction,
++				  struct dbc_request **reqs, int n,
++				  void (*fn)(struct xhci_dbc *, struct dbc_request *))
++{
++	struct dbc_request	*req;
++	int			i;
++
++	for (i = 0; i < n; i++) {
++		req = dbc_alloc_request(dbc, direction, GFP_KERNEL);
++		if (!req)
++			return -ENOMEM;
++		/* kmalloc() aligns power-of-two sizes naturally. */
++		req->buf = kmalloc(DBC_NET_BUF_SIZE, GFP_KERNEL);
++		if (!req->buf) {
++			dbc_free_request(req);
++			return -ENOMEM;
++		}
++		req->complete = fn;
++		reqs[i] = req;
++	}
++
++	return 0;
++}
++
++static void xhci_dbc_net_remove(struct xhci_dbc *dbc)
++{
++	struct dbc_net		*net = dbc->priv;
++	struct net_device	*ndev = net->ndev;
++
++	/* Closing the interface stops NAPI before the DbC goes. */
++	unregister_netdev(ndev);
++	xhci_dbc_remove(dbc);
++	dbc_net_free_requests(net->rx_reqs, DBC_NET_RX_REQS);
++	dbc_net_free_requests(net->tx_reqs, DBC_NET_TX_REQS);
++	free_netdev(ndev);
++}
++
++static const struct dbc_driver dbc_net_driver = {
++	.configure		= dbc_net_configure,
++	.disconnect		= dbc_net_disconnect,
++	.remove			= xhci_dbc_net_remove,
++};
++
++int xhci_dbc_net_probe(struct device *dev, void __iomem *base, struct xhci_hcd *xhci)
++{
++	struct net_device	*ndev;
++	struct xhci_dbc		*dbc;
++	struct dbc_net		*net;
++	int			ret;
++
++	ndev = alloc_netdev(sizeof(*net), "dbc%d", NET_NAME_ENUM, dbc_net_setup);
++	if (!ndev)
++		return -ENOMEM;
++
++	net = netdev_priv(ndev);
++	net->ndev = ndev;
++	spin_lock_init(&net->rx_lock);
++	spin_lock_init(&net->tx_lock);
++	INIT_LIST_HEAD(&net->rx_done);
++	INIT_LIST_HEAD(&net->tx_pool);
++	netif_napi_add(ndev, &net->napi, dbc_net_poll);
++	SET_NETDEV_DEV(ndev, dev);
++	netif_carrier_off(ndev);
++
++	dbc = xhci_alloc_dbc(dev, base, &dbc_net_driver);
++	if (!dbc) {
++		ret = -ENOMEM;
++		goto err_free_netdev;
++	}
++	dbc->priv = net;
++	dbc->bInterfaceProtocol = DBC_NET_PROTOCOL;
++	net->dbc = dbc;
++
++	ret = dbc_net_alloc_requests(dbc, BULK_IN, net->rx_reqs,
++				     DBC_NET_RX_REQS, dbc_net_rx_complete);
++	if (ret)
++		goto err_free_requests;
++	ret = dbc_net_alloc_requests(dbc, BULK_OUT, net->tx_reqs,
++				     DBC_NET_TX_REQS, dbc_net_tx_complete);
++	if (ret)
++		goto err_free_requests;
++
++	ret = register_netdev(ndev);
++	if (ret)
++		goto err_free_requests;
++
++	/* get rid of xhci once this is a real driver binding to a device */
++	xhci->dbc = dbc;
++
++	return 0;
++
++err_free_requests:
++	dbc_net_free_requests(net->rx_reqs, DBC_NET_RX_REQS);
++	dbc_net_free_requests(net->tx_reqs, DBC_NET_TX_REQS);
++	xhci_dbc_remove(dbc);
++err_free_netdev:
++	free_netdev(ndev);
++	dev_err(dev, "can't register DbC network interface, err %d\n", ret);
++
++	return ret;
++}
+-- 
+2.56.0
+

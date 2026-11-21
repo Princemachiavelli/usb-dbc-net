@@ -9,6 +9,9 @@ testers.runNixOSTest {
   nodes.machine =
     { pkgs, ... }:
     {
+      # dbcnet.ko, for the last subtest; the impostor offers protocol 01, the
+      # tty's, until then, so usb_debug and dbcnet-host take it.
+      imports = [ ./nixos-debug-host.nix ];
       boot.kernelModules = [
         "dummy_hcd"
         "raw_gadget"
@@ -84,5 +87,24 @@ testers.runNixOSTest {
         connects(6)
         link_up(TARGET, "10.77.0.1")
         ping("", "10.77.0.1", 1024)
+
+    # Presenting dbc_net's protocol 00 instead brings in the debug host's
+    # kernel driver.
+    with subtest("dbcnet.ko drives a target that offers protocol 00"):
+        machine.succeed("systemctl stop dbcnet-host impostor")
+        start("impostor", f"{TARGET}dbc-impostor --tun dbc0 --protocol 0")
+        wait("test dbcnet = \"$(basename $(readlink -f /sys/class/net/dbc0/device/driver))\"")
+        link_up(TARGET, "10.77.0.1")
+        link_up("", "10.77.0.2")
+        wait("ping -c 1 -W 1 10.77.0.1")
+
+    subtest_frames()
+    with subtest("throughput with dbcnet.ko"):
+        start("iperf", f"{TARGET}iperf3 -s")
+        wait(f"{TARGET}ss -ltn | rg -q 5201")
+        print("BENCH impostor + dbcnet.ko mtu 9000")
+        print(machine.succeed("iperf3 -c 10.77.0.1 -t 5 -f m"))
+        print(machine.succeed("iperf3 -c 10.77.0.1 -t 5 -f m -R"))
+        machine.succeed("systemctl stop iperf")
   '';
 }

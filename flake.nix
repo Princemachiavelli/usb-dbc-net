@@ -18,23 +18,34 @@
       packages = forAllSystems (pkgs: rec {
         dbcnet = pkgs.callPackage ./nix/package.nix { };
         default = dbcnet;
-        # Not callPackage: linuxPackagesFor needs the kernel's own .override.
-        linux-dbgcap = import ./nix/linux-dbgcap.nix { inherit (pkgs) lib linuxPackages; };
+        # For the default kernel; NixOS configurations build their own.
+        xhci-hcd-dbc = pkgs.linuxPackages.callPackage ./nix/xhci-hcd-dbc.nix { };
+        dbcnet-kmod = pkgs.linuxPackages.callPackage ./nix/dbcnet-kmod.nix { };
         qemu-dbc = pkgs.callPackage ./nix/qemu-dbc.nix { };
       });
 
       checks = forAllSystems (
         pkgs:
         let
-          inherit (self.packages.${pkgs.stdenv.hostPlatform.system}) dbcnet linux-dbgcap qemu-dbc;
+          inherit (self.packages.${pkgs.stdenv.hostPlatform.system}) dbcnet qemu-dbc;
         in
         {
           # Builds and runs the framing unit tests.
           inherit dbcnet;
           vm-impostor = pkgs.callPackage ./nix/vm-impostor.nix { inherit dbcnet; };
-          vm-dbc = pkgs.callPackage ./nix/vm-dbc.nix { inherit dbcnet linux-dbgcap qemu-dbc; };
+          kconfig-split = pkgs.callPackage ./nix/kconfig-split.nix { };
+          vm-dbc = pkgs.callPackage ./nix/vm-dbc.nix { inherit dbcnet qemu-dbc; };
+          vm-dbc-notty = pkgs.callPackage ./nix/vm-dbc.nix {
+            inherit dbcnet qemu-dbc;
+            tty = false;
+          };
         }
       );
+
+      nixosModules = {
+        target = ./nix/nixos-target.nix;
+        debug-host = ./nix/nixos-debug-host.nix;
+      };
 
       devShells = forAllSystems (pkgs: {
         default = pkgs.mkShell {

@@ -281,6 +281,15 @@ dummy_hcd, not by anything real hardware would do.
       of the hardcoded `xhci_dbc_tty_probe()`. Batch frames NTB-style into
       large transfers, and send a ZLP when a transfer is an exact multiple
       of 1024.
+
+   Status: phases 2–4 are built and tested against a DbC emulation in
+   QEMU (`QEMU-DBC.md`, `KERNEL.md`). Two things differ from this plan:
+   - DbC cannot send a ZLP, so the target pads instead.
+   - The function is chosen by a module parameter, and the target is told
+     apart from ttyDBC by interface protocol 0, not by a custom
+     `dbc_idProduct`.
+
+   Phase 1, on real hardware, is still to do.
 3. **Pure USB 2.0 with no special cable is impossible.** Something has to be
    a device. On USB 2.0 that something can only be a bridge chip, since DbC
    is SuperSpeed-only and EHCI's debug port needs an external debug device.

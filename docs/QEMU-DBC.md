@@ -25,8 +25,10 @@ The peer stays detached while the guest has DbC disabled. On enable it
 enumerates with the guest's DCDDI identity and its info-context strings.
 `device_del cable` unplugs it; the guest sees CCS drop.
 
-`nix/vm-dbc.nix` runs the guest's own DbC driver against the emulation,
-with milestones 1 and 2 of the plan:
+`nix/vm-dbc.nix` runs the guest's own DbC driver against the emulation.
+It first covered milestones 1 and 2 of the plan, as below. Milestone 3,
+the in-kernel `dbc_net`, came next and now runs first in the same test;
+see [`KERNEL.md`](KERNEL.md). The tty checks:
 - ttyDBC0 ↔ ttyUSB0 carries 1 MiB each way intact.
 - The `vm-impostor` checks run unchanged against ttyDBC: frames of
   64–9004 bytes both ways and iperf3 both ways. A target that stops
@@ -38,9 +40,27 @@ with milestones 1 and 2 of the plan:
 iperf3 through ttyDBC and `dbcnet-tty` gave 165–229 Mb/s, against about
 600–715 Mb/s for the impostor. The likely cause is ttyDBC: 16 requests
 of 1 KiB, a tty layer and a polled event loop, where the impostor moves
-32 KiB per read. That is not profiled yet. It is the case for milestone
-3's in-kernel `dbc_net`. Both ends share one VM, so the numbers are only
-indicative.
+32 KiB per read. That was the case for milestone 3's in-kernel
+`dbc_net`, which moves roughly 0.7–1.5 Gb/s through the same emulation
+([`KERNEL.md`](KERNEL.md)). Both ends share one VM, so the numbers are
+only indicative.
+
+`vm-dbc` also measures the baseline that needs no code of ours: stock
+PPP between ttyDBC0 and `usb_debug`'s ttyUSB0 (asyncmap 0, no
+compression). One run, iperf3 for 5 s each way, in Mb/s:
+
+| Link | MTU | host → target | target → host |
+|---|---|---|---|
+| dbcnet-tty | 9000 | 162 | 220 |
+| dbcnet-tty | 1500 | 110 | 150 |
+| PPP | 1500 | 66 | 58 |
+
+At the same MTU dbcnet is about 1.7–2.6× PPP. PPP also lost packets:
+TCP retransmitted 322 and 220 segments in the two runs, against 64 and
+24 for dbcnet at 1500 and none at 9000. Where those drops happen is not
+traced. Both links share ttyDBC's 1 KiB requests on the target, and
+`usb_debug` reads 1 KiB per transfer on the host, so neither is the
+tty-free path `dbc_net` is meant to be.
 
 ### What building it found
 
@@ -72,8 +92,9 @@ one property the scoping predicted.
    - Seen on 6.18.64; 7.3.4 has the same code, so real hardware should hit
      it too.
    - [`nix/linux-dbc-ring-dequeue.patch`](../nix/linux-dbc-ring-dequeue.patch)
-     advances `dequeue` past each completed TRB, and the test kernel
-     carries it. It is a candidate for upstream.
+     advances `dequeue` past each completed TRB. The `xhci-hcd` module
+     build (`nix/xhci-hcd-dbc.nix`) carries it. It is a candidate for
+     upstream.
 3. **A dbcnet bug: abandoning a bulk OUT desynchronises the stream.**
    - `dbcnet-host` used to give up on a bulk OUT after 2 s. By then the
      target had already taken part of it, as real hardware does, packet by
@@ -93,8 +114,7 @@ one property the scoping predicted.
    1024-byte boundary. `--no-pad` shows the reply arriving only at the
    host's read timeout.
 
-Not done:
-- milestone 3, the in-kernel `dbc_net`;
+Not done in the emulation:
 - migration (a blocker is registered);
 - endpoint halt (DbC never stalls, and `CLEAR_FEATURE(ENDPOINT_HALT)` is
   acked).

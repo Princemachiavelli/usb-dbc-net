@@ -1,0 +1,66 @@
+From 891fd35e81e22e125b6bf74a20636ec3c736ea4e Mon Sep 17 00:00:00 2001
+From: Josh Hoffer <jhoffer@sansorgan.es>
+Date: Sat, 21 Nov 2026 10:39:28 -0800
+Subject: [RFC PATCH 1/2] usb: xhci: dbc: let the function undo its own probe
+
+xhci_remove_dbc_dev() calls xhci_dbc_tty_remove() directly, so the tty
+is the only function the DbC core can tear down. Add a remove op to
+struct dbc_driver and call it instead, so that another function can
+supply its own. ttyDBC's is xhci_dbc_tty_remove(); no functional change.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Signed-off-by: Josh Hoffer <jhoffer@sansorgan.es>
+---
+ drivers/usb/host/xhci-dbgcap.c | 5 +++--
+ drivers/usb/host/xhci-dbgcap.h | 2 ++
+ drivers/usb/host/xhci-dbgtty.c | 1 +
+ 3 files changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/usb/host/xhci-dbgcap.c b/drivers/usb/host/xhci-dbgcap.c
+index f999503..4945b51 100644
+--- a/drivers/usb/host/xhci-dbgcap.c
++++ b/drivers/usb/host/xhci-dbgcap.c
+@@ -1379,12 +1379,13 @@ int xhci_create_dbc_dev(struct xhci_hcd *xhci)
+ 
+ void xhci_remove_dbc_dev(struct xhci_hcd *xhci)
+ {
++	struct xhci_dbc		*dbc = xhci->dbc;
+ 	unsigned long		flags;
+ 
+-	if (!xhci->dbc)
++	if (!dbc)
+ 		return;
+ 
+-	xhci_dbc_tty_remove(xhci->dbc);
++	dbc->driver->remove(dbc);
+ 	spin_lock_irqsave(&xhci->lock, flags);
+ 	xhci->dbc = NULL;
+ 	spin_unlock_irqrestore(&xhci->lock, flags);
+diff --git a/drivers/usb/host/xhci-dbgcap.h b/drivers/usb/host/xhci-dbgcap.h
+index 5426c97..0e717a3 100644
+--- a/drivers/usb/host/xhci-dbgcap.h
++++ b/drivers/usb/host/xhci-dbgcap.h
+@@ -120,6 +120,8 @@ struct dbc_port {
+ struct dbc_driver {
+ 	int (*configure)(struct xhci_dbc *dbc);
+ 	void (*disconnect)(struct xhci_dbc *dbc);
++	/* undoes the probe that allocated dbc, xhci_dbc_remove() included */
++	void (*remove)(struct xhci_dbc *dbc);
+ };
+ 
+ struct xhci_dbc {
+diff --git a/drivers/usb/host/xhci-dbgtty.c b/drivers/usb/host/xhci-dbgtty.c
+index fda5cca..4f0fdb3 100644
+--- a/drivers/usb/host/xhci-dbgtty.c
++++ b/drivers/usb/host/xhci-dbgtty.c
+@@ -573,6 +573,7 @@ static void xhci_dbc_tty_unregister_device(struct xhci_dbc *dbc)
+ static const struct dbc_driver dbc_driver = {
+ 	.configure		= xhci_dbc_tty_register_device,
+ 	.disconnect		= xhci_dbc_tty_unregister_device,
++	.remove			= xhci_dbc_tty_remove,
+ };
+ 
+ int xhci_dbc_tty_probe(struct device *dev, void __iomem *base, struct xhci_hcd *xhci)
+-- 
+2.56.0
+
