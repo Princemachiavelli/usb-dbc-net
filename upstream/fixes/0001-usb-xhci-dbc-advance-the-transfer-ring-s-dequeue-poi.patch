@@ -22,9 +22,9 @@ mainline has the same code.
 
 Found and written, with this changelog, by Claude Opus 5.5, an AI coding
 assistant, while running ttyDBC against an emulation of DbC in QEMU that
-the assistant also wrote. Tested in that emulation on 6.18.64, where ttyDBC
-and the dbc_net function in this series now run for many laps of the
-rings.
+the assistant also wrote. Tested in that emulation on 7.4-rc3 and 6.18.64,
+where ttyDBC and the dbc_net function in this series now run for many
+laps of the rings.
 
 Fixes: 7ee645963075 ("usb: xhci: remove legacy 'num_trbs_free' tracking")
 Cc: stable@vger.kernel.org

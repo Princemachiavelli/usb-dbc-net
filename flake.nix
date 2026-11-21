@@ -40,6 +40,16 @@
             inherit dbcnet qemu-dbc;
             tty = false;
           };
+          # upstream/'s series, as it would be sent, on mainline.
+          vm-dbc-mainline = pkgs.callPackage ./nix/vm-dbc.nix {
+            inherit dbcnet qemu-dbc;
+            mainline = true;
+          };
+          vm-dbc-mainline-notty = pkgs.callPackage ./nix/vm-dbc.nix {
+            inherit dbcnet qemu-dbc;
+            tty = false;
+            mainline = true;
+          };
         }
       );
 

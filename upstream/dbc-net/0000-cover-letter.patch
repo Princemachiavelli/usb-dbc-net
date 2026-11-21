@@ -69,6 +69,8 @@ Josh Hoffer (3):
  6 files changed, 618 insertions(+), 10 deletions(-)
  create mode 100644 drivers/usb/host/xhci-dbgnet.c
 
+base-commit: aebb7274476403040d582c61478df8f4a7bf9cd3
+
 -- 
 2.56.0
 

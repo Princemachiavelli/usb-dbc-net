@@ -5,8 +5,8 @@ Subject: [PATCH 0/2] usb: xhci: dbc: two fixes in the DbC core
 
 Two fixes in xhci-dbgcap.c, found while running Linux's own DbC driver
 against an emulation of the debug capability in QEMU. They are against
-7.4-rc3. They were tested on a 6.18.64 backport, whose ring handling is
-the same; there, 2/2 needs only context changes.
+7.4-rc3 and were tested there, and as a backport on 6.18.64. On 6.18,
+2/2 is written differently, since xhci_dbc_stop() was rewritten after it.
 
 1/2 DbC transfer rings fill after one lap (about 254 TRBs) since the
     num_trbs_free counter was removed, because nothing in the DbC driver
@@ -32,6 +32,8 @@ Josh Hoffer (2):
 
  drivers/usb/host/xhci-dbgcap.c | 49 +++++++++++++++++++++-------------
  1 file changed, 30 insertions(+), 19 deletions(-)
+
+base-commit: aebb7274476403040d582c61478df8f4a7bf9cd3
 
 -- 
 2.56.0

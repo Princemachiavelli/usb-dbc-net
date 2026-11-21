@@ -11,9 +11,20 @@ in
     the controller. Without this, the module has no tty code at all
   '';
 
+  options.hardware.dbc-net.patches = lib.mkOption {
+    type = lib.types.nullOr (lib.types.listOf lib.types.path);
+    default = null;
+    description = ''
+      The DbC series for xhci-hcd, if not the 6.18 one in nix/: for
+      another kernel, such as mainline with nix/mainline-patches.nix.
+    '';
+  };
+
   config = {
     boot.extraModulePackages = [
-      (config.boot.kernelPackages.callPackage ./xhci-hcd-dbc.nix { inherit (cfg) tty; })
+      (config.boot.kernelPackages.callPackage ./xhci-hcd-dbc.nix (
+        { inherit (cfg) tty; } // lib.optionalAttrs (cfg.patches != null) { dbcPatches = cfg.patches; }
+      ))
     ];
     boot.kernelParams = lib.optional cfg.tty "xhci_hcd.dbc_net=1";
   };

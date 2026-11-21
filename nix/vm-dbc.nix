@@ -17,9 +17,12 @@
   dbcnet,
   qemu-dbc,
   tty ? true,
+  # Mainline (linux_testing) with upstream/'s patches, instead of the
+  # default kernel with the 6.18 backport.
+  mainline ? false,
 }:
 testers.runNixOSTest {
-  name = "dbcnet-dbc" + lib.optionalString (!tty) "-notty";
+  name = "dbcnet-dbc" + lib.optionalString (!tty) "-notty" + lib.optionalString mainline "-mainline";
 
   nodes.machine =
     {
@@ -33,7 +36,11 @@ testers.runNixOSTest {
         ./nixos-target.nix
         ./nixos-debug-host.nix
       ];
-      hardware.dbc-net = { inherit tty; };
+      hardware.dbc-net = {
+        inherit tty;
+        patches = if mainline then import ./mainline-patches.nix else null;
+      };
+      boot.kernelPackages = lib.mkIf mainline pkgs.linuxPackages_testing;
       boot.kernelModules = [
         "tun"
         "ppp_async"

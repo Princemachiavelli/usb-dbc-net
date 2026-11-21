@@ -18,6 +18,12 @@ How they're checked:
   
   It fails once `linux_testing` moves on and a patch stops applying.
 - **`checks.kconfig-split` and the VM tests** do the same for `v6.18/`.
+- **`checks.vm-dbc-mainline` and `vm-dbc-mainline-notty`** boot 7.4-rc3
+  with the top-level series and run the whole VM test on it, including
+  DbC disabled and re-enabled under traffic. This is the stop fix exactly
+  as it would be sent. The one thing not run there is `dbcnet.c`'s
+  `kzalloc_obj()` variant; the tests load `kmod/dbcnet.c`, which differs
+  from it only in that allocation.
 - **Each step of the series builds on its own,** on both bases.
 - **checkpatch (7.4-rc3)** has no errors. The remaining warnings are:
   - the `Co-Authored-By` trailers;
@@ -65,12 +71,24 @@ Before sending, which only you can do:
 - **Edit the "Tool use" paragraphs.** They describe the work as the
   assistant saw it. Add your own part: what you reviewed, changed or
   directed.
+- **Choose the AI trailer.**
+  - These carry `Co-Authored-By: Claude …`, your usual choice. It isn't a
+    kernel tag: `submitting-patches.rst` says such extra tags are "just
+    ... ignored for now", and checkpatch warns about it.
+  - `Co-developed-by:` doesn't fit, because it must be followed by that
+    co-author's `Signed-off-by:`, which an AI may not add.
+  - The disclosure the rules ask for is already in each changelog, so
+    dropping the trailer would lose nothing.
 - **Rebase onto `usb-next` and `net-next`** if they have moved past
   mainline.
 - **Decide on a MAINTAINERS entry** for `dbcnet.c` and `xhci-dbgnet.c`.
   One would name you.
-- **Find the recipients** with `scripts/get_maintainer.pl`: xHCI is Mathias
-  Nyman, on linux-usb@vger.kernel.org; the usbnet driver goes to
-  netdev@vger.kernel.org.
+- **Find the recipients** with `scripts/get_maintainer.pl`:
+  - xHCI is Mathias Nyman, on linux-usb@vger.kernel.org;
+  - the usbnet driver goes to netdev@vger.kernel.org;
+  - everything also goes to linux-kernel@vger.kernel.org.
+  
+  The cover letters and the host patch carry `base-commit:` (v7.4-rc3).
+  Regenerate with `git format-patch --base` if you rebase.
 - **Test on real hardware,** as the RFC's cover letter promises before a
   non-RFC posting.

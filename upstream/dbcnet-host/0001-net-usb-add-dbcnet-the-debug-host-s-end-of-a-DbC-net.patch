@@ -27,7 +27,9 @@ Written, with this changelog, by Claude Opus 5.5, an AI coding assistant,
 together with the dbc_net series it pairs with. Tested only in QEMU, with
 an emulation of DbC the assistant also wrote: enumeration and module
 autoload by product ID, MTUs up to 9000, ping and iperf3 both ways, cable
-unplug and DbC disable while the link is up.
+unplug and DbC disable while the link is up. The tests ran an
+out-of-tree copy that differs only in allocating with kzalloc(); this
+patch was build-tested on 7.4-rc3.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
@@ -373,6 +375,8 @@ index 0000000..301090e
 +
 +MODULE_DESCRIPTION("Network link to a Linux target over the xHCI Debug Capability");
 +MODULE_LICENSE("GPL");
+base-commit: aebb7274476403040d582c61478df8f4a7bf9cd3
+
 -- 
 2.56.0
 

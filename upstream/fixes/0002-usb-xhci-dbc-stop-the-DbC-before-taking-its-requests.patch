@@ -29,9 +29,9 @@ in its pool.
 Found by reading the code, and written with this changelog, by Claude
 Opus 5.5, an AI coding assistant. There is no reproducer: the leak was not
 observed, and the test kernel had no DMA-API debugging to show it. Tested
-on 6.18.64 in a QEMU emulation of DbC: DbC disabled and re-enabled five
-times under traffic in both directions, with no warnings, and the link
-working afterwards.
+on 7.4-rc3, and as a backport on 6.18.64, in a QEMU emulation of DbC: DbC
+disabled and re-enabled five times under traffic in both directions, with
+no warnings, and the link working afterwards.
 
 Fixes: efe3e3ae5a66 ("xhci: dbc: Flush queued requests before stopping dbc")
 Cc: stable@vger.kernel.org
