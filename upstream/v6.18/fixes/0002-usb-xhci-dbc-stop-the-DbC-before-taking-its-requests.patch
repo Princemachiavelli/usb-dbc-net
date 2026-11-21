@@ -1,0 +1,101 @@
+From 01aa1b843bbcbd2f7615c1895e1fb5f758a22a66 Mon Sep 17 00:00:00 2001
+From: Josh Hoffer <jhoffer@sansorgan.es>
+Date: Sat, 21 Nov 2026 13:16:31 -0800
+Subject: [PATCH 2/2] usb: xhci: dbc: stop the DbC before taking its requests
+ back
+
+xhci_dbc_stop() gives back the pending requests while the state is still
+DS_CONFIGURED. Then it calls the function's disconnect, and only then
+stops the controller and sets DS_DISABLED. Two things follow:
+
+- A request queued in that window is accepted, since dbc_ep_queue() only
+  checks for DS_CONFIGURED, and it is never given back. Each completion
+  runs with dbc->lock dropped, so the queue can come from the function's
+  own receive path as well as from a writer. The request's DMA mapping
+  leaks: an IOVA behind an IOMMU, or a bounce buffer with swiotlb.
+- The requests are given back, and their buffers reused or freed, while
+  the controller is still running and may still write into them.
+
+Stop the controller and set DS_DISABLED first, under the lock, and only
+then flush. dbc_ep_queue() then refuses new requests, and the event work
+sees DS_DISABLED and stops. Cancel the event work before calling
+disconnect, so that a configure it had already begun finishes first and
+the function ends up disconnected.
+
+ttyDBC copes with the requeue being refused: its write completion does
+not restart on -ESHUTDOWN, and its read path puts a refused request back
+in its pool.
+
+Found by reading the code, and written with this changelog, by Claude
+Opus 5.5, an AI coding assistant. There is no reproducer: the leak was not
+observed, and the test kernel had no DMA-API debugging to show it. Tested
+on 6.18.64 in a QEMU emulation of DbC: DbC disabled and re-enabled five
+times under traffic in both directions, with no warnings, and the link
+working afterwards.
+
+Fixes: efe3e3ae5a66 ("xhci: dbc: Flush queued requests before stopping dbc")
+Cc: stable@vger.kernel.org
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/usb/host/xhci-dbgcap.c | 35 +++++++++++++++++-----------------
+ 1 file changed, 17 insertions(+), 18 deletions(-)
+
+diff --git a/drivers/usb/host/xhci-dbgcap.c b/drivers/usb/host/xhci-dbgcap.c
+index f999503..a054abc 100644
+--- a/drivers/usb/host/xhci-dbgcap.c
++++ b/drivers/usb/host/xhci-dbgcap.c
+@@ -682,34 +682,33 @@ static int xhci_dbc_start(struct xhci_dbc *dbc)
+ 
+ static void xhci_dbc_stop(struct xhci_dbc *dbc)
+ {
+-	int ret;
++	enum dbc_state		state;
++	int			ret;
+ 	unsigned long		flags;
+ 
+ 	WARN_ON(!dbc);
+ 
+-	switch (dbc->state) {
+-	case DS_DISABLED:
+-		return;
+-	case DS_CONFIGURED:
+-		spin_lock(&dbc->lock);
+-		xhci_dbc_flush_requests(dbc);
+-		spin_unlock(&dbc->lock);
+-
+-		if (dbc->driver->disconnect)
+-			dbc->driver->disconnect(dbc);
+-		break;
+-	default:
+-		break;
+-	}
+-
+-	cancel_delayed_work_sync(&dbc->event_work);
+-
++	/*
++	 * Stop the DbC before taking its requests back. Once the state is
++	 * DS_DISABLED, dbc_ep_queue() refuses new requests and the event work
++	 * does nothing more, so none can be queued after the flush, and the
++	 * controller no longer owns the buffers being given back.
++	 */
+ 	spin_lock_irqsave(&dbc->lock, flags);
++	state = dbc->state;
+ 	ret = xhci_do_dbc_stop(dbc);
++	if (!ret && state == DS_CONFIGURED)
++		xhci_dbc_flush_requests(dbc);
+ 	spin_unlock_irqrestore(&dbc->lock, flags);
+ 	if (ret)
+ 		return;
+ 
++	/* A configure the event work had already begun finishes first. */
++	cancel_delayed_work_sync(&dbc->event_work);
++
++	if (state == DS_CONFIGURED && dbc->driver->disconnect)
++		dbc->driver->disconnect(dbc);
++
+ 	xhci_dbc_mem_cleanup(dbc);
+ 	pm_runtime_put_sync(dbc->dev); /* note, was self.controller */
+ }
+-- 
+2.56.0
+

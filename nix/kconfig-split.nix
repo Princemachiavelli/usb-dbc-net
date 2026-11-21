@@ -19,17 +19,19 @@
   elfutils,
   pkg-config,
   ripgrep,
+  # The DbC series for this kernel; nix/mainline.nix passes upstream/'s.
+  dbcPatches ? [
+    ./linux-dbc-ring-dequeue.patch
+    ./linux-dbc-stop.patch
+    ./linux-dbc-net.patch
+  ],
+  hostPatch ? ../upstream/v6.18/dbcnet-host/0001-net-usb-add-dbcnet-the-debug-host-s-end-of-a-DbC-net.patch,
 }:
 stdenv.mkDerivation {
   name = "dbc-kconfig-split";
   inherit (linux) src;
 
-  patches = [
-    ./linux-dbc-ring-dequeue.patch
-    ./linux-dbc-stop.patch
-    ./linux-dbc-net.patch
-    ../upstream/dbcnet-host/0001-net-usb-add-dbcnet-the-debug-host-s-end-of-a-DbC-net.patch
-  ];
+  patches = dbcPatches ++ [ hostPatch ];
 
   nativeBuildInputs = [
     bc

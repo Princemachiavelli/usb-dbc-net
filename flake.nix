@@ -34,6 +34,7 @@
           inherit dbcnet;
           vm-impostor = pkgs.callPackage ./nix/vm-impostor.nix { inherit dbcnet; };
           kconfig-split = pkgs.callPackage ./nix/kconfig-split.nix { };
+          mainline = pkgs.callPackage ./nix/mainline.nix { };
           vm-dbc = pkgs.callPackage ./nix/vm-dbc.nix { inherit dbcnet qemu-dbc; };
           vm-dbc-notty = pkgs.callPackage ./nix/vm-dbc.nix {
             inherit dbcnet qemu-dbc;

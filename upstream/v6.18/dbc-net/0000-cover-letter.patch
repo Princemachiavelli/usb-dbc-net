@@ -1,0 +1,74 @@
+From 831c98fffc09d35adf7e3e2acd6c85c955100243 Mon Sep 17 00:00:00 2001
+From: Josh Hoffer <jhoffer@sansorgan.es>
+Date: Sat, 21 Nov 2026 13:51:14 -0800
+Subject: [RFC PATCH 0/3] usb: xhci: dbc: a network function beside ttyDBC
+
+The xHCI debug capability lets two ordinary PCs talk over a USB 3 debug
+cable, with no device controller on either side. Today it can only be
+ttyDBC. This RFC adds a second function, dbc_net: a raw IP interface on
+the DbC's two bulk rings. The debug host's end, a small usbnet
+minidriver, is posted alongside for netdev ("net: usb: add dbcnet").
+
+  1/3 lets each DbC function supply its own remove; no functional change.
+  2/3 moves ttyDBC under its own option, USB_XHCI_DBGCAP_TTY, default y.
+  3/3 adds dbc_net, under USB_XHCI_DBGCAP_NET.
+
+Throughput, as iperf3 between the two ends, in Mb/s:
+
+  link                       MTU 9000            MTU 1500
+  dbc_net + usbnet driver    900-1650            660-1300
+  ttyDBC + userspace bridge  170-230             110-180
+  pppd over ttyDBC           -                   60-90
+
+These numbers are from a QEMU emulation of the debug capability, with both
+machines in one guest, not from real hardware. They show where the cost
+lies, not what a real link will do. Real-hardware results will follow
+before a non-RFC posting.
+
+Questions for review:
+- A product ID. The debug host must tell dbc_net from ttyDBC. The
+  interface protocol can't do it, since ttyDBC users may already set it to
+  0 or 1 through sysfs. So dbc_net presents its own Linux Foundation
+  product ID, as ttyDBC (0x0010) and the early printk console (0x0011)
+  have theirs. This uses 0x0012 provisionally. Could one be assigned?
+- Selection. This uses a module parameter, read when a controller is set
+  up. A sysfs attribute beside "dbc" is probably better; which would you
+  take?
+- Kconfig. With 2/3 and 3/3, USB_XHCI_DBGCAP needs only TTY || NET.
+  Tested on x86_64 defconfig: DBGCAP alone, both functions, and TTY=n
+  with NET.
+- The framing: a 4-byte header (magic 0xdb5e, BE16 length) per packet,
+  as a byte stream.
+
+This series is on top of the two DbC fixes posted separately: "advance
+the transfer ring's dequeue pointer", without which DbC rings fill after
+one lap since commit 7ee645963075, and "stop the DbC before taking its
+requests back".
+
+Tool use: this series, the usbnet driver posted with it, their
+changelogs and this letter were written by Claude Opus 5.5, an AI coding
+assistant, in Claude Code. The prompts were high-level: an IP network
+link between two PCs over a USB 3 debug cable, with neither side in
+gadget mode, then without the tty layer, then prepared for upstream. The
+design questions above were left open on purpose. Testing was in NixOS VM
+tests against an emulation of DbC in QEMU, which the assistant also
+wrote: both functions, Kconfig with and without TTY, enable and disable
+under traffic, cable unplug, and USB/IP over the link.
+
+Josh Hoffer (3):
+  usb: xhci: dbc: let the function undo its own probe
+  usb: xhci: dbc: give ttyDBC its own Kconfig option
+  usb: xhci: dbc: add a network function, dbc_net
+
+ drivers/usb/host/Kconfig       |  27 +-
+ drivers/usb/host/Makefile      |   4 +-
+ drivers/usb/host/xhci-dbgcap.c |  29 +-
+ drivers/usb/host/xhci-dbgcap.h |   3 +
+ drivers/usb/host/xhci-dbgnet.c | 564 +++++++++++++++++++++++++++++++++
+ drivers/usb/host/xhci-dbgtty.c |   1 +
+ 6 files changed, 618 insertions(+), 10 deletions(-)
+ create mode 100644 drivers/usb/host/xhci-dbgnet.c
+
+-- 
+2.56.0
+

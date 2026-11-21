@@ -1,0 +1,37 @@
+From 01aa1b843bbcbd2f7615c1895e1fb5f758a22a66 Mon Sep 17 00:00:00 2001
+From: Josh Hoffer <jhoffer@sansorgan.es>
+Date: Sat, 21 Nov 2026 13:51:14 -0800
+Subject: [PATCH 0/2] usb: xhci: dbc: two fixes in the DbC core
+
+Two fixes in xhci-dbgcap.c, found while running Linux's own DbC driver
+against an emulation of the debug capability in QEMU:
+
+1/2 DbC transfer rings fill after one lap (about 254 TRBs) since the
+    num_trbs_free counter was removed, because nothing in the DbC driver
+    advances ring->dequeue. ttyDBC goes quiet after roughly 254 KiB.
+    Seen on 6.18.64; mainline has the same code.
+
+2/2 Disabling the DbC gives back its requests before stopping it. A
+    request queued in between is never given back and leaks its DMA
+    mapping, and the controller can still write into buffers already
+    given back. Found by reading the code and not seen in testing;
+    covered by enable/disable cycles under traffic.
+
+Tool use: both fixes, their changelogs and this letter were written by
+Claude Opus 5.5, an AI coding assistant, in Claude Code. The prompts were
+high-level: build an IP link over DbC without the tty layer, then prepare
+what could go upstream. Fix 1 came from that work; fix 2 from the
+assistant reading xhci_dbc_stop(). Testing was in NixOS VM tests against
+an emulation of DbC in QEMU, which the assistant also wrote, and not on
+real hardware.
+
+Josh Hoffer (2):
+  usb: xhci: dbc: advance the transfer ring's dequeue pointer
+  usb: xhci: dbc: stop the DbC before taking its requests back
+
+ drivers/usb/host/xhci-dbgcap.c | 44 ++++++++++++++++++++--------------
+ 1 file changed, 26 insertions(+), 18 deletions(-)
+
+-- 
+2.56.0
+

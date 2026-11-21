@@ -1,4 +1,4 @@
-From 65e49607873ea60586e2b3975e037c2eea2a7c8e Mon Sep 17 00:00:00 2001
+From 5772b715fe9f0cea083fe193d09d74efbd224ff5 Mon Sep 17 00:00:00 2001
 From: Josh Hoffer <jhoffer@sansorgan.es>
 Date: Sat, 21 Nov 2026 13:09:03 -0800
 Subject: [RFC PATCH 2/3] usb: xhci: dbc: give ttyDBC its own Kconfig option
@@ -9,8 +9,10 @@ under USB_XHCI_DBGCAP_TTY, default y, so that existing configs keep it
 and another function can be built with or without it. The core calls
 into the tty only when it is built.
 
+Written, with this changelog, by Claude Opus 5.5, an AI coding assistant.
+See the cover letter for how it was made and tested.
+
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
-Signed-off-by: Josh Hoffer <jhoffer@sansorgan.es>
 ---
  drivers/usb/host/Kconfig       | 16 +++++++++++++---
  drivers/usb/host/Makefile      |  3 ++-
@@ -18,7 +20,7 @@ Signed-off-by: Josh Hoffer <jhoffer@sansorgan.es>
  3 files changed, 24 insertions(+), 7 deletions(-)
 
 diff --git a/drivers/usb/host/Kconfig b/drivers/usb/host/Kconfig
-index 87103b8..4df3275 100644
+index 05a8896..ba5e056 100644
 --- a/drivers/usb/host/Kconfig
 +++ b/drivers/usb/host/Kconfig
 @@ -33,9 +33,19 @@ config USB_XHCI_DBGCAP
@@ -45,7 +47,7 @@ index 87103b8..4df3275 100644
  config USB_XHCI_PCI
  	tristate
 diff --git a/drivers/usb/host/Makefile b/drivers/usb/host/Makefile
-index 4df946c..c193614 100644
+index 174580c..f7f6907 100644
 --- a/drivers/usb/host/Makefile
 +++ b/drivers/usb/host/Makefile
 @@ -16,7 +16,8 @@ xhci-hcd-y += xhci-ring.o xhci-hub.o xhci-dbg.o
@@ -59,10 +61,10 @@ index 4df946c..c193614 100644
  
  xhci-mtk-hcd-y := xhci-mtk.o xhci-mtk-sch.o
 diff --git a/drivers/usb/host/xhci-dbgcap.c b/drivers/usb/host/xhci-dbgcap.c
-index a1b3254..f07d327 100644
+index ec1077e..722cfd1 100644
 --- a/drivers/usb/host/xhci-dbgcap.c
 +++ b/drivers/usb/host/xhci-dbgcap.c
-@@ -1371,7 +1371,10 @@ int xhci_create_dbc_dev(struct xhci_hcd *xhci)
+@@ -1599,7 +1599,10 @@ int xhci_create_dbc_dev(struct xhci_hcd *xhci)
  	if (xhci->dbc)
  		return -EBUSY;
  
@@ -74,7 +76,7 @@ index a1b3254..f07d327 100644
  
  	return ret;
  }
-@@ -1432,10 +1435,13 @@ int xhci_dbc_resume(struct xhci_hcd *xhci)
+@@ -1667,10 +1670,13 @@ int xhci_dbc_resume(struct xhci_hcd *xhci)
  
  int xhci_dbc_init(void)
  {

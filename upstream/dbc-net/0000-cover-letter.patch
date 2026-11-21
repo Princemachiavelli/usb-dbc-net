@@ -1,6 +1,6 @@
-From 6803bbddb1e734c8488286aca613b249ff01ce96 Mon Sep 17 00:00:00 2001
+From 7bdcec830bf6f7bb9b4e59c4575a297132aa223d Mon Sep 17 00:00:00 2001
 From: Josh Hoffer <jhoffer@sansorgan.es>
-Date: Sat, 21 Nov 2026 13:16:38 -0800
+Date: Sat, 21 Nov 2026 13:51:15 -0800
 Subject: [RFC PATCH 0/3] usb: xhci: dbc: a network function beside ttyDBC
 
 The xHCI debug capability lets two ordinary PCs talk over a USB 3 debug
@@ -44,6 +44,16 @@ This series is on top of the two DbC fixes posted separately: "advance
 the transfer ring's dequeue pointer", without which DbC rings fill after
 one lap since commit 7ee645963075, and "stop the DbC before taking its
 requests back".
+
+Tool use: this series, the usbnet driver posted with it, their
+changelogs and this letter were written by Claude Opus 5.5, an AI coding
+assistant, in Claude Code. The prompts were high-level: an IP network
+link between two PCs over a USB 3 debug cable, with neither side in
+gadget mode, then without the tty layer, then prepared for upstream. The
+design questions above were left open on purpose. Testing was in NixOS VM
+tests against an emulation of DbC in QEMU, which the assistant also
+wrote: both functions, Kconfig with and without TTY, enable and disable
+under traffic, cable unplug, and USB/IP over the link.
 
 Josh Hoffer (3):
   usb: xhci: dbc: let the function undo its own probe

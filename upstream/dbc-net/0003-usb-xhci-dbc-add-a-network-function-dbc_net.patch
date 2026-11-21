@@ -1,4 +1,4 @@
-From 6803bbddb1e734c8488286aca613b249ff01ce96 Mon Sep 17 00:00:00 2001
+From 7bdcec830bf6f7bb9b4e59c4575a297132aa223d Mon Sep 17 00:00:00 2001
 From: Josh Hoffer <jhoffer@sansorgan.es>
 Date: Sat, 21 Nov 2026 13:09:11 -0800
 Subject: [RFC PATCH 3/3] usb: xhci: dbc: add a network function, dbc_net
@@ -37,8 +37,10 @@ TTY or NET, so a kernel without the tty layer can have DbC for the first
 time. With both functions built, the dbc_net module parameter picks one
 when a controller is set up.
 
+Written, with this changelog, by Claude Opus 5.5, an AI coding assistant.
+See the cover letter for how it was made and tested.
+
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
-Signed-off-by: Josh Hoffer <jhoffer@sansorgan.es>
 ---
  drivers/usb/host/Kconfig       |  11 +-
  drivers/usb/host/Makefile      |   1 +
@@ -49,7 +51,7 @@ Signed-off-by: Josh Hoffer <jhoffer@sansorgan.es>
  create mode 100644 drivers/usb/host/xhci-dbgnet.c
 
 diff --git a/drivers/usb/host/Kconfig b/drivers/usb/host/Kconfig
-index 4df3275..541efec 100644
+index ba5e056..5e9f914 100644
 --- a/drivers/usb/host/Kconfig
 +++ b/drivers/usb/host/Kconfig
 @@ -30,7 +30,7 @@ config USB_XHCI_HCD
@@ -78,7 +80,7 @@ index 4df3275..541efec 100644
  	tristate
  	depends on USB_PCI
 diff --git a/drivers/usb/host/Makefile b/drivers/usb/host/Makefile
-index c193614..2a1017c 100644
+index f7f6907..6085782 100644
 --- a/drivers/usb/host/Makefile
 +++ b/drivers/usb/host/Makefile
 @@ -18,6 +18,7 @@ xhci-hcd-y += xhci-trace.o
@@ -90,12 +92,12 @@ index c193614..2a1017c 100644
  
  xhci-mtk-hcd-y := xhci-mtk.o xhci-mtk-sch.o
 diff --git a/drivers/usb/host/xhci-dbgcap.c b/drivers/usb/host/xhci-dbgcap.c
-index f07d327..bd8f143 100644
+index 722cfd1..88844c7 100644
 --- a/drivers/usb/host/xhci-dbgcap.c
 +++ b/drivers/usb/host/xhci-dbgcap.c
-@@ -29,6 +29,16 @@
- #include "xhci-trace.h"
- #include "xhci-dbgcap.h"
+@@ -35,6 +35,16 @@ static const struct dbc_str dbc_str_default = {
+ 	.serial = "0001",
+ };
  
 +#if IS_ENABLED(CONFIG_USB_XHCI_DBGCAP_TTY) && IS_ENABLED(CONFIG_USB_XHCI_DBGCAP_NET)
 +static bool dbc_net;
@@ -110,7 +112,7 @@ index f07d327..bd8f143 100644
  static void dbc_free_ctx(struct device *dev, struct xhci_container_ctx *ctx)
  {
  	if (!ctx)
-@@ -1371,7 +1381,9 @@ int xhci_create_dbc_dev(struct xhci_hcd *xhci)
+@@ -1599,7 +1609,9 @@ int xhci_create_dbc_dev(struct xhci_hcd *xhci)
  	if (xhci->dbc)
  		return -EBUSY;
  
@@ -122,10 +124,10 @@ index f07d327..bd8f143 100644
  	else
  		ret = -ENODEV;
 diff --git a/drivers/usb/host/xhci-dbgcap.h b/drivers/usb/host/xhci-dbgcap.h
-index 0e717a3..298d7f8 100644
+index e4c3eb8..4c51fdd 100644
 --- a/drivers/usb/host/xhci-dbgcap.h
 +++ b/drivers/usb/host/xhci-dbgcap.h
-@@ -216,6 +216,7 @@ int dbc_tty_init(void);
+@@ -239,6 +239,7 @@ int dbc_tty_init(void);
  void dbc_tty_exit(void);
  int xhci_dbc_tty_probe(struct device *dev, void __iomem *res, struct xhci_hcd *xhci);
  void xhci_dbc_tty_remove(struct xhci_dbc *dbc);

@@ -264,17 +264,21 @@ throughput.
   - The ring fix's context differs on 6.12 and earlier. Those kernels don't
     need the fix, but the patch will fail to apply.
   - `dbc_net` uses 6.12+ interfaces, such as `<linux/unaligned.h>`.
-- **Upstreaming.** The two core fixes are ready to send. `dbc_net` would need a
-  sysfs selector rather than a module parameter, documentation, an
-  assigned product ID, and agreement on the framing. `upstream/` has the
-  series. The Kconfig split has been
-  through real kernel configs (`checks.kconfig-split`), building
-  `drivers/usb/host` in the full tree three ways:
-  - existing configs (`USB_XHCI_DBGCAP=y` alone) still get ttyDBC and no
-    `dbc_net`;
-  - both functions together;
-  - a `TTY=n` kernel, which before could not have DbC at all, gets
-    `dbc_net` alone, with no tty references.
+- **Upstreaming.** The two core fixes are ready for your review and
+  sign-off. `dbc_net` would need a sysfs selector rather than a module
+  parameter, documentation, an assigned product ID, and agreement on the
+  framing.
+  - **Where the series is:** `upstream/` holds it against mainline
+    (7.4-rc3; `checks.mainline`). `upstream/v6.18/` holds the backport
+    these tests run.
+  - **The Kconfig split** has been through real kernel configs
+    (`checks.kconfig-split`, and `checks.mainline` on 7.4-rc3), building
+    `drivers/usb/host` in the full tree three ways:
+    - existing configs (`USB_XHCI_DBGCAP=y` alone) still get ttyDBC and
+      no `dbc_net`;
+    - both functions together;
+    - a `TTY=n` kernel, which before could not have DbC at all, gets
+      `dbc_net` alone, with no tty references.
 
-  It has been booted only as the out-of-tree module.
+    It has been booted only as the out-of-tree module.
 - **Statistics.** These use `net_device.stats` without per-CPU counters.

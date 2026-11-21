@@ -1,4 +1,4 @@
-From a46b09b25761d3f842922854d5953d53db7c701d Mon Sep 17 00:00:00 2001
+From 66f9d5dfba5a9d3a6cfd6a89638e367c9e4a1849 Mon Sep 17 00:00:00 2001
 From: Josh Hoffer <jhoffer@sansorgan.es>
 Date: Sat, 21 Nov 2026 13:14:53 -0800
 Subject: [RFC PATCH net-next] net: usb: add dbcnet, the debug host's end of a
@@ -23,13 +23,18 @@ controller on either side.
   packet size. That rule does nothing here, since every frame carries a
   header and every transfer ends short, so the driver sets its own.
 
+Written, with this changelog, by Claude Opus 5.5, an AI coding assistant,
+together with the dbc_net series it pairs with. Tested only in QEMU, with
+an emulation of DbC the assistant also wrote: enumeration and module
+autoload by product ID, MTUs up to 9000, ping and iperf3 both ways, cable
+unplug and DbC disable while the link is up.
+
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
-Signed-off-by: Josh Hoffer <jhoffer@sansorgan.es>
 ---
  drivers/net/usb/Kconfig  |  13 ++
  drivers/net/usb/Makefile |   1 +
- drivers/net/usb/dbcnet.c | 294 +++++++++++++++++++++++++++++++++++++++
- 3 files changed, 308 insertions(+)
+ drivers/net/usb/dbcnet.c | 296 +++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 310 insertions(+)
  create mode 100644 drivers/net/usb/dbcnet.c
 
 diff --git a/drivers/net/usb/Kconfig b/drivers/net/usb/Kconfig
@@ -68,10 +73,10 @@ index 4964f7b..c12dc2a 100644
  obj-$(CONFIG_USB_RTL8153_ECM)	+= r8153_ecm.o
 diff --git a/drivers/net/usb/dbcnet.c b/drivers/net/usb/dbcnet.c
 new file mode 100644
-index 0000000..49978ad
+index 0000000..301090e
 --- /dev/null
 +++ b/drivers/net/usb/dbcnet.c
-@@ -0,0 +1,294 @@
+@@ -0,0 +1,296 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * dbcnet - the debug host's end of a network link over the xHCI Debug
@@ -295,15 +300,17 @@ index 0000000..49978ad
 +static int dbcnet_bind(struct usbnet *dev, struct usb_interface *intf)
 +{
 +	struct net_device	*net = dev->net;
++	struct dbcnet		*d;
 +	int			ret;
 +
 +	ret = usbnet_get_endpoints(dev, intf);
 +	if (ret)
 +		return ret;
 +
-+	dev->driver_priv = kzalloc(sizeof(struct dbcnet), GFP_KERNEL);
-+	if (!dev->driver_priv)
++	d = kzalloc_obj(*d);
++	if (!d)
 +		return -ENOMEM;
++	dev->driver_priv = d;
 +
 +	/* Raw IP on a point-to-point link: no link-layer header at all. */
 +	net->netdev_ops = &dbcnet_netdev_ops;

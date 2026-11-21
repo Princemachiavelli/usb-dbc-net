@@ -16,6 +16,12 @@
   kernelModuleMakeFlags,
   ripgrep,
   tty ? false,
+  # The DbC series for this kernel; nix/mainline.nix passes upstream/'s.
+  dbcPatches ? [
+    ./linux-dbc-ring-dequeue.patch
+    ./linux-dbc-stop.patch
+    ./linux-dbc-net.patch
+  ],
 }:
 let
   build = "${kernel.dev}/lib/modules/${kernel.modDirVersion}/build";
@@ -25,19 +31,22 @@ stdenv.mkDerivation {
   inherit (kernel) version src;
 
   # Only the xHCI sources; the tree the module builds against is kernel.dev.
+  # Release kernels come as a tarball, rc kernels as a source tree.
   unpackPhase = ''
     runHook preUnpack
     mkdir source
-    tar xf $src -C source --strip-components=1 --wildcards '*/drivers/usb/host/*'
+    if [ -d $src ]; then
+      mkdir -p source/drivers/usb
+      cp -r $src/drivers/usb/host source/drivers/usb/
+      chmod -R u+w source
+    else
+      tar xf $src -C source --strip-components=1 --wildcards '*/drivers/usb/host/*'
+    fi
     cd source
     runHook postUnpack
   '';
 
-  patches = [
-    ./linux-dbc-ring-dequeue.patch
-    ./linux-dbc-stop.patch
-    ./linux-dbc-net.patch
-  ];
+  patches = dbcPatches;
 
   # Just xhci-hcd from the directory's Makefile, with DbC forced on. The
   # kernel's config has no say here, so the functions are set as flags too.
