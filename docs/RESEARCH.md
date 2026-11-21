@@ -242,7 +242,13 @@ special cable.
   case would never be exercised.
 - A VM only helps by keeping a crashing in-development driver off the
   workstation.
-- The target-side DbC netdev still needs real hardware.
+- The target-side DbC netdev still needs real hardware, or DbC emulation in
+  QEMU (see `QEMU-DBC.md`).
+
+This rig is built as `nix/vm-impostor.nix` (see README). In a 2-vCPU VM the
+userspace prototype moved ~705 Mb/s host→target and ~556 Mb/s
+target→host. These figures are bounded by the userspace programs and
+dummy_hcd, not by anything real hardware would do.
 
 ---
 
