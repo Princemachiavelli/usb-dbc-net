@@ -5,7 +5,8 @@
 #   both     both functions;
 #   notty    a kernel without the tty layer (TTY=n), where DbC used to be
 #            impossible: dbc_net alone, and nothing that needs a tty.
-# Each builds drivers/usb/host and checks which DbC objects came out.
+# Each builds drivers/usb/host and checks which DbC objects came out. The
+# debug host's driver, as its upstream patch adds it, is built under "both".
 {
   lib,
   stdenv,
@@ -25,7 +26,9 @@ stdenv.mkDerivation {
 
   patches = [
     ./linux-dbc-ring-dequeue.patch
+    ./linux-dbc-stop.patch
     ./linux-dbc-net.patch
+    ../upstream/dbcnet-host/0001-net-usb-add-dbcnet-the-debug-host-s-end-of-a-DbC-net.patch
   ];
 
   nativeBuildInputs = [
@@ -87,10 +90,13 @@ stdenv.mkDerivation {
     state default USB_XHCI_DBGCAP_NET n
     objs default xhci-dbgcap.o xhci-dbgtty.o -- xhci-dbgnet.o
 
-    config both -e USB_XHCI_DBGCAP -e USB_XHCI_DBGCAP_NET
+    config both -e USB_XHCI_DBGCAP -e USB_XHCI_DBGCAP_NET -e USB_USBNET -e USB_NET_DBCNET
     state both USB_XHCI_DBGCAP_TTY y
     state both USB_XHCI_DBGCAP_NET y
+    state both USB_NET_DBCNET y
     objs both xhci-dbgcap.o xhci-dbgtty.o xhci-dbgnet.o
+    make O=build-both -j$NIX_BUILD_CORES drivers/net/usb/ >/dev/null
+    [ -e build-both/drivers/net/usb/dbcnet.o ] || { echo "both: dbcnet.o missing" >&2; exit 1; }
 
     config notty -e EXPERT -d TTY -e USB_XHCI_DBGCAP -e USB_XHCI_DBGCAP_NET
     state notty TTY n

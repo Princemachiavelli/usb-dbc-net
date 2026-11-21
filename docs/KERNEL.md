@@ -51,6 +51,8 @@ just `xhci-hcd` from the running kernel's source, with:
 - DbC forced on;
 - the ring fix ([`nix/linux-dbc-ring-dequeue.patch`](../nix/linux-dbc-ring-dequeue.patch)),
   without which a DbC ring fills after one lap on kernels after 6.12;
+- the stop fix ([`nix/linux-dbc-stop.patch`](../nix/linux-dbc-stop.patch)),
+  described below under "Fixes in the DbC core";
 - `dbc_net`, and ttyDBC only with `tty = true`.
 
 Without the tty, the build checks that the module references no `tty_*`
@@ -164,6 +166,35 @@ So the first packet after an idle spell can wait up to 64 ms. The tests set
   every frame carries a header and the ZLP is sent anyway. `dbcnet` uses its
   own `ndo_change_mtu`, and `vm-dbc` checks 8192.
 
+## Fixes in the DbC core
+
+Both affect ttyDBC as much as `dbc_net`. Both are in `upstream/fixes/`.
+
+1. **Transfer rings fill after one lap.** See
+   [`QEMU-DBC.md`](QEMU-DBC.md), "What building it found", item 2. The
+   cause is upstream commit `7ee645963075`.
+2. **Disabling the DbC could leak a request.**
+   - **The window:** `xhci_dbc_stop()` (`disable`, suspend, removal) gave
+     back the pending requests while the state was still
+     `DS_CONFIGURED`. Only then did it call the function's `disconnect`,
+     and after that stop the controller.
+   - **What slipped in:** in that window, `dbc_ep_queue()` still accepted
+     requests: NAPI requeueing a `dbc_net` receive buffer, `xmit`, or a
+     ttyDBC write. Such a request was never given back, so its DMA
+     mapping leaked.
+   - **A second problem:** the controller was still running while its
+     buffers were handed back.
+   - **The fix:** stop the controller and set `DS_DISABLED` under the lock
+     first, and only then flush. `dbc_ep_queue()` then refuses new
+     requests and the event work stops.
+   - **Ordering:** the event work is cancelled before `disconnect`, so a
+     `configure` it had already started finishes first.
+   - **Testing:** found by reading the code. `vm-dbc` now floods both
+     ways with 8000-byte frames while disabling and re-enabling DbC five
+     times, then checks the link and dmesg. Without DMA-API debugging in
+     the test kernel, the leak itself can't be observed, before or after
+     the fix.
+
 ## Results
 
 These come from one run, on 2026-11-21, of `vm-dbc` and `vm-impostor`
@@ -233,7 +264,7 @@ throughput.
   - The ring fix's context differs on 6.12 and earlier. Those kernels don't
     need the fix, but the patch will fail to apply.
   - `dbc_net` uses 6.12+ interfaces, such as `<linux/unaligned.h>`.
-- **Upstreaming.** The ring fix is ready to send. `dbc_net` would need a
+- **Upstreaming.** The two core fixes are ready to send. `dbc_net` would need a
   sysfs selector rather than a module parameter, documentation, an
   assigned product ID, and agreement on the framing. `upstream/` has the
   series. The Kconfig split has been
@@ -246,26 +277,4 @@ throughput.
     `dbc_net` alone, with no tty references.
 
   It has been booted only as the out-of-tree module.
-- **A race in the DbC core, analysed but not fixed.** It is not seen in
-  any test.
-  - **The window:** `xhci_dbc_stop()` (`disable`, suspend, removal) gives
-    back the pending requests while the state is still `DS_CONFIGURED`.
-    Only then does it call the function's `disconnect`, and later set
-    `DS_DISABLED`.
-  - **What can slip in:** in between, `dbc_ep_queue()` still accepts
-    requests. For `dbc_net`, that's NAPI requeueing a receive buffer or
-    `xmit` submitting one. ttyDBC's write path can do the same.
-  - **The effect:** such a request is never given back, so its DMA mapping
-    leaks: an IOVA under an IOMMU, or a bounce buffer under swiotlb.
-    Nothing is corrupted: the endpoint lists are reinitialised at the next
-    enable, and `dbc_net` rebuilds its pools from its own arrays.
-  - **Why the obvious fixes fail:**
-    - Flushing after `disconnect` would hand completions to ttyDBC after
-      it has freed its port.
-    - Setting `DS_ENABLED` before the flush, as the cable-unplug path
-      does, lets the still-running event work walk back up to
-      `DS_CONFIGURED` and call `configure` again.
-  - **A fix** wants a stopping state, which the event work and
-    `dbc_ep_queue()` both refuse, set under the lock before the flush.
-    That's a core change, best proposed alongside the RFC.
 - **Statistics.** These use `net_device.stats` without per-CPU counters.

@@ -1,4 +1,4 @@
-From d74cfc8550629ce18ec06385610151c8a8b4941e Mon Sep 17 00:00:00 2001
+From 65e49607873ea60586e2b3975e037c2eea2a7c8e Mon Sep 17 00:00:00 2001
 From: Josh Hoffer <jhoffer@sansorgan.es>
 Date: Sat, 21 Nov 2026 13:09:03 -0800
 Subject: [RFC PATCH 2/3] usb: xhci: dbc: give ttyDBC its own Kconfig option
@@ -59,10 +59,10 @@ index 4df946c..c193614 100644
  
  xhci-mtk-hcd-y := xhci-mtk.o xhci-mtk-sch.o
 diff --git a/drivers/usb/host/xhci-dbgcap.c b/drivers/usb/host/xhci-dbgcap.c
-index 4945b51..6f25a2b 100644
+index a1b3254..f07d327 100644
 --- a/drivers/usb/host/xhci-dbgcap.c
 +++ b/drivers/usb/host/xhci-dbgcap.c
-@@ -1372,7 +1372,10 @@ int xhci_create_dbc_dev(struct xhci_hcd *xhci)
+@@ -1371,7 +1371,10 @@ int xhci_create_dbc_dev(struct xhci_hcd *xhci)
  	if (xhci->dbc)
  		return -EBUSY;
  
@@ -74,7 +74,7 @@ index 4945b51..6f25a2b 100644
  
  	return ret;
  }
-@@ -1433,10 +1436,13 @@ int xhci_dbc_resume(struct xhci_hcd *xhci)
+@@ -1432,10 +1435,13 @@ int xhci_dbc_resume(struct xhci_hcd *xhci)
  
  int xhci_dbc_init(void)
  {

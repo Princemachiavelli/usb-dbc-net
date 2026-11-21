@@ -35,6 +35,7 @@ stdenv.mkDerivation {
 
   patches = [
     ./linux-dbc-ring-dequeue.patch
+    ./linux-dbc-stop.patch
     ./linux-dbc-net.patch
   ];
 

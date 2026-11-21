@@ -54,7 +54,7 @@ index 4df946c..2a1017c 100644
  
  xhci-mtk-hcd-y := xhci-mtk.o xhci-mtk-sch.o
 diff --git a/drivers/usb/host/xhci-dbgcap.c b/drivers/usb/host/xhci-dbgcap.c
-index f999503..93fcfef 100644
+index a054abc..bd8f143 100644
 --- a/drivers/usb/host/xhci-dbgcap.c
 +++ b/drivers/usb/host/xhci-dbgcap.c
 @@ -29,6 +29,16 @@
@@ -74,7 +74,7 @@ index f999503..93fcfef 100644
  static void dbc_free_ctx(struct device *dev, struct xhci_container_ctx *ctx)
  {
  	if (!ctx)
-@@ -1372,19 +1382,25 @@ int xhci_create_dbc_dev(struct xhci_hcd *xhci)
+@@ -1371,19 +1381,25 @@ int xhci_create_dbc_dev(struct xhci_hcd *xhci)
  	if (xhci->dbc)
  		return -EBUSY;
  
@@ -103,7 +103,7 @@ index f999503..93fcfef 100644
  	spin_lock_irqsave(&xhci->lock, flags);
  	xhci->dbc = NULL;
  	spin_unlock_irqrestore(&xhci->lock, flags);
-@@ -1432,10 +1448,13 @@ int xhci_dbc_resume(struct xhci_hcd *xhci)
+@@ -1431,10 +1447,13 @@ int xhci_dbc_resume(struct xhci_hcd *xhci)
  
  int xhci_dbc_init(void)
  {

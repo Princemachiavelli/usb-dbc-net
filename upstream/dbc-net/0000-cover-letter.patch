@@ -1,13 +1,13 @@
-From 1f59886e02ae8d0ad6b77a868aa2037528bfce77 Mon Sep 17 00:00:00 2001
+From 6803bbddb1e734c8488286aca613b249ff01ce96 Mon Sep 17 00:00:00 2001
 From: Josh Hoffer <jhoffer@sansorgan.es>
-Date: Sat, 21 Nov 2026 13:10:54 -0800
+Date: Sat, 21 Nov 2026 13:16:38 -0800
 Subject: [RFC PATCH 0/3] usb: xhci: dbc: a network function beside ttyDBC
 
 The xHCI debug capability lets two ordinary PCs talk over a USB 3 debug
 cable, with no device controller on either side. Today it can only be
 ttyDBC. This RFC adds a second function, dbc_net: a raw IP interface on
-the DbC's two bulk rings. The debug host's end is a small usbnet
-minidriver, not part of this series.
+the DbC's two bulk rings. The debug host's end, a small usbnet
+minidriver, is posted alongside for netdev ("net: usb: add dbcnet").
 
   1/3 lets each DbC function supply its own remove; no functional change.
   2/3 moves ttyDBC under its own option, USB_XHCI_DBGCAP_TTY, default y.
@@ -39,12 +39,11 @@ Questions for review:
   with NET.
 - The framing: a 4-byte header (magic 0xdb5e, BE16 length) per packet,
   as a byte stream.
-- The host driver. A usbnet minidriver matching the new product ID would
-  go under drivers/net/usb. It is ready, if this direction is wanted.
 
-This series is on top of "usb: xhci: dbc: advance the transfer ring's
-dequeue pointer", posted separately as a fix. Without it, DbC rings fill
-after one lap on kernels since commit 7ee645963075.
+This series is on top of the two DbC fixes posted separately: "advance
+the transfer ring's dequeue pointer", without which DbC rings fill after
+one lap since commit 7ee645963075, and "stop the DbC before taking its
+requests back".
 
 Josh Hoffer (3):
   usb: xhci: dbc: let the function undo its own probe

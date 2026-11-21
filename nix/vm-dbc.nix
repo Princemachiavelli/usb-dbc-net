@@ -195,6 +195,22 @@ testers.runNixOSTest {
           wait("ping -c 1 -W 1 10.77.0.1")
           ping("", "10.77.0.1", 4096)
 
+      # The stop path with requests in flight both ways: floods from each end
+      # while DbC goes down and comes back, five times.
+      with subtest("DbC survives disable and enable under traffic"):
+          start("flood-target", f"{TARGET}ping -q -f -s 8000 10.77.0.2")
+          start("flood-host", "ping -q -f -s 8000 10.77.0.1")
+          for _ in range(5):
+              machine.succeed("sleep 1", f"echo disable > {dbc('dbc')}")
+              wait("! test -e /sys/class/net/dbc0")
+              machine.succeed(f"echo enable > {dbc('dbc')}")
+              host_link_up()
+          machine.succeed("systemctl stop flood-target flood-host")
+          wait("ping -c 1 -W 1 10.77.0.1")
+          for frame in (1024, 4096, 9004):
+              ping("", "10.77.0.1", frame)
+          machine.fail("dmesg | rg -q 'BUG:|WARNING:'")
+
       # The userspace debug host, for hosts without dbcnet.ko.
       with subtest("dbcnet-host drives the same target from userspace"):
           machine.succeed(f"echo {host_intf()} > /sys/bus/usb/drivers/dbcnet/unbind")

@@ -1,4 +1,4 @@
-From 1f59886e02ae8d0ad6b77a868aa2037528bfce77 Mon Sep 17 00:00:00 2001
+From 6803bbddb1e734c8488286aca613b249ff01ce96 Mon Sep 17 00:00:00 2001
 From: Josh Hoffer <jhoffer@sansorgan.es>
 Date: Sat, 21 Nov 2026 13:09:11 -0800
 Subject: [RFC PATCH 3/3] usb: xhci: dbc: add a network function, dbc_net
@@ -90,7 +90,7 @@ index c193614..2a1017c 100644
  
  xhci-mtk-hcd-y := xhci-mtk.o xhci-mtk-sch.o
 diff --git a/drivers/usb/host/xhci-dbgcap.c b/drivers/usb/host/xhci-dbgcap.c
-index 6f25a2b..93fcfef 100644
+index f07d327..bd8f143 100644
 --- a/drivers/usb/host/xhci-dbgcap.c
 +++ b/drivers/usb/host/xhci-dbgcap.c
 @@ -29,6 +29,16 @@
@@ -110,7 +110,7 @@ index 6f25a2b..93fcfef 100644
  static void dbc_free_ctx(struct device *dev, struct xhci_container_ctx *ctx)
  {
  	if (!ctx)
-@@ -1372,7 +1382,9 @@ int xhci_create_dbc_dev(struct xhci_hcd *xhci)
+@@ -1371,7 +1381,9 @@ int xhci_create_dbc_dev(struct xhci_hcd *xhci)
  	if (xhci->dbc)
  		return -EBUSY;
  
