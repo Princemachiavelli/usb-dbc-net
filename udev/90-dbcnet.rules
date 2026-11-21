@@ -1,7 +1,0 @@
-# usb_debug binds every 1d6b:0010 device by VID:PID. A dbc_net target says so
-# with bInterfaceProtocol 00 (ttyDBC's is 01), so if usb_debug took one before
-# dbcnet was registered, hand it over.
-ACTION=="bind", SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_interface", DRIVER=="usb_debug", \
-  ATTR{bInterfaceClass}=="dc", ATTR{bInterfaceSubClass}=="02", ATTR{bInterfaceProtocol}=="00", \
-  TEST=="/sys/bus/usb/drivers/dbcnet", \
-  RUN+="/bin/sh -c 'echo %k > /sys/bus/usb/drivers/usb_debug/unbind; echo %k > /sys/bus/usb/drivers/dbcnet/bind'"

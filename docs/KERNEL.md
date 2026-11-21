@@ -24,8 +24,8 @@ On NixOS, import the flake's modules:
   whose only DbC function is `dbc_net`, with no tty code. To keep ttyDBC
   as an alternative, set `hardware.dbc-net.tty = true`. The module then
   carries both, and sets `xhci_hcd.dbc_net=1`.
-- `nixosModules.debug-host` on the debug host. It loads `dbcnet` at boot
-  and installs the udev rule described under "The debug host" below.
+- `nixosModules.debug-host` on the debug host. It installs `dbcnet.ko`,
+  which loads by modalias when a `dbc_net` target enumerates.
 
 Then, on the target:
 
@@ -91,12 +91,23 @@ The parameter was the smallest change that works out of tree.
 - It is raw IP: `ARPHRD_NONE`, point-to-point, with no ARP. The MTU defaults
   to 1500 and can go up to 65528.
 
-### The interface protocol
+### Its USB identity
 
-- `dbc_net` sets the DbC's `bInterfaceProtocol` to 0, which the xHCI spec
-  calls "vendor defined"; ttyDBC uses 1.
-- The VID:PID stays `1d6b:0010`, so `dbcnet-host` finds it as before.
-- The protocol lets a debug host's drivers tell the two functions apart.
+- `dbc_net` presents the DbC as `1d6b:0012`. ttyDBC is `1d6b:0010`, and
+  the early printk console is `1d6b:0011`; each Linux DbC function has its
+  own product ID.
+  - 0012 is unused but not assigned. Linux Foundation product IDs are
+    reserved by the USB maintainers, so the RFC asks for one.
+- The interface protocol is 0, "vendor defined" in the xHCI spec. ttyDBC
+  uses 1, "GNU Remote Debug Command".
+- The protocol can't identify the function, which an earlier version
+  relied on. ttyDBC users can set it to 0 or 1 through
+  `dbc_bInterfaceProtocol`, so a ttyDBC target at protocol 0 would have
+  been claimed by `dbcnet.ko`.
+- With its own product ID, `usb_debug` (which matches 0010 and 0011)
+  never sees `dbc_net`. No udev rule, load-order trick or `usb_debug`
+  patch is needed.
+- `dbcnet-host` looks for 0012, then 0010, unless `--pid` says otherwise.
 
 ### Transmit
 
@@ -137,13 +148,9 @@ So the first packet after an idle spell can wait up to 64 ms. The tests set
 
 ## The debug host: dbcnet.ko
 
-- **Matching:** it binds `1d6b:0010` with interface class `dc/02` and
-  protocol `00`, which is `dbc_net` and not ttyDBC.
-- **The `usb_debug` race:** `usb_debug` matches `1d6b:0010` by VID:PID
-  alone, and the first registered driver wins. So `dbcnet` is loaded at
-  boot. If `usb_debug` gets there first anyway,
-  [`udev/90-dbcnet.rules`](../udev/90-dbcnet.rules) unbinds it and binds
-  `dbcnet`; `vm-dbc` forces that case to check the rule.
+- **Matching:** it binds `1d6b:0012` with interface class `dc`, and is
+  autoloaded by modalias. `vm-dbc` checks that `usb_debug` can't be bound
+  to a `dbc_net` target.
 - **Interface:** usbnet's Ethernet device is turned into raw IP, the same
   way `qmi_wwan`'s raw-IP mode does it, and named `dbcN`.
 - **Receive:** 16 KiB URBs, several in flight. The stream decoder keeps its
@@ -227,8 +234,9 @@ throughput.
     need the fix, but the patch will fail to apply.
   - `dbc_net` uses 6.12+ interfaces, such as `<linux/unaligned.h>`.
 - **Upstreaming.** The ring fix is ready to send. `dbc_net` would need a
-  sysfs selector rather than a module parameter, documentation, and
-  agreement on protocol 0 and on the framing. The Kconfig split has been
+  sysfs selector rather than a module parameter, documentation, an
+  assigned product ID, and agreement on the framing. `upstream/` has the
+  series. The Kconfig split has been
   through real kernel configs (`checks.kconfig-split`), building
   `drivers/usb/host` in the full tree three ways:
   - existing configs (`USB_XHCI_DBGCAP=y` alone) still get ttyDBC and no
@@ -238,8 +246,26 @@ throughput.
     `dbc_net` alone, with no tty references.
 
   It has been booted only as the out-of-tree module.
-- **A known race.** A `dbc_net` request queued between the DbC core's flush
-  and its state change on `disable` is never given back. That leaks one DMA
-  mapping, and the request is reused at the next configure. The window is
-  the core's, not `dbc_net`'s; whether ttyDBC can hit it is not checked.
+- **A race in the DbC core, analysed but not fixed.** It is not seen in
+  any test.
+  - **The window:** `xhci_dbc_stop()` (`disable`, suspend, removal) gives
+    back the pending requests while the state is still `DS_CONFIGURED`.
+    Only then does it call the function's `disconnect`, and later set
+    `DS_DISABLED`.
+  - **What can slip in:** in between, `dbc_ep_queue()` still accepts
+    requests. For `dbc_net`, that's NAPI requeueing a receive buffer or
+    `xmit` submitting one. ttyDBC's write path can do the same.
+  - **The effect:** such a request is never given back, so its DMA mapping
+    leaks: an IOVA under an IOMMU, or a bounce buffer under swiotlb.
+    Nothing is corrupted: the endpoint lists are reinitialised at the next
+    enable, and `dbc_net` rebuilds its pools from its own arrays.
+  - **Why the obvious fixes fail:**
+    - Flushing after `disconnect` would hand completions to ttyDBC after
+      it has freed its port.
+    - Setting `DS_ENABLED` before the flush, as the cable-unplug path
+      does, lets the still-running event work walk back up to
+      `DS_CONFIGURED` and call `configure` again.
+  - **A fix** wants a stopping state, which the event work and
+    `dbc_ep_queue()` both refuse, set under the lock before the flush.
+    That's a core change, best proposed alongside the RFC.
 - **Statistics.** These use `net_device.stats` without per-CPU counters.

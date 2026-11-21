@@ -9,8 +9,23 @@ order, they give exactly the code the checks test. Base: Linux 6.18.64,
 - `ring-fix/` is a standalone fix, meant for stable: DbC transfer rings
   fill after one lap since 7ee645963075 ("usb: xhci: remove legacy
   'num_trbs_free' tracking").
-- `dbc-net/` is an RFC: a `remove` op for DbC functions, then `dbc_net`
-  with the Kconfig split. It applies on top of the fix.
+- `dbc-net/` is an RFC in three patches, applying on top of the fix:
+  1. a `remove` op for DbC functions;
+  2. ttyDBC under its own Kconfig option;
+  3. `dbc_net`, which asks for a product ID (0012 provisional).
+
+Not written yet:
+- **The host driver**, `kmod/dbcnet.c`, as a `drivers/net/usb` patch for
+  netdev. It only makes sense once `dbc_net` and its product ID are
+  accepted.
+- **A fix for the DbC core's stop race** (`docs/KERNEL.md`, "Not done"),
+  which needs a new stopping state.
+- **QEMU's DbC emulation**, on branch `dbc` of `~/srcs/qemu-dbc`. For
+  qemu-devel it needs migration support, a qtest, docs, and a split into
+  a series.
+
+Not needed: a `usb_debug` change. With `dbc_net` on its own product ID,
+`usb_debug`'s match on 0010 and 0011 never sees it.
 
 Before sending:
 - **Rebase onto `usb-next`** (Greg KH's usb tree) and rebuild. They were

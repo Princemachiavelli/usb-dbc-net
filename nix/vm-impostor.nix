@@ -9,8 +9,8 @@ testers.runNixOSTest {
   nodes.machine =
     { pkgs, ... }:
     {
-      # dbcnet.ko, for the last subtest; the impostor offers protocol 01, the
-      # tty's, until then, so usb_debug and dbcnet-host take it.
+      # dbcnet.ko, for the last subtests; until then the impostor is ttyDBC's
+      # 1d6b:0010, so usb_debug and dbcnet-host take it.
       imports = [ ./nixos-debug-host.nix ];
       boot.kernelModules = [
         "dummy_hcd"
@@ -88,11 +88,11 @@ testers.runNixOSTest {
         link_up(TARGET, "10.77.0.1")
         ping("", "10.77.0.1", 1024)
 
-    # Presenting dbc_net's protocol 00 instead brings in the debug host's
-    # kernel driver.
-    with subtest("dbcnet.ko drives a target that offers protocol 00"):
+    # Presenting dbc_net's 1d6b:0012 instead brings in the debug host's
+    # kernel driver, loaded by modalias.
+    with subtest("dbcnet.ko drives a target that presents as dbc_net"):
         machine.succeed("systemctl stop dbcnet-host impostor")
-        start("impostor", f"{TARGET}dbc-impostor --tun dbc0 --protocol 0")
+        start("impostor", f"{TARGET}dbc-impostor --tun dbc0 --pid 0012 --protocol 0")
         wait("test dbcnet = \"$(basename $(readlink -f /sys/class/net/dbc0/device/driver))\"")
         link_up(TARGET, "10.77.0.1")
         link_up("", "10.77.0.2")

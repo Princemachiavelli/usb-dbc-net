@@ -1,0 +1,95 @@
+From d74cfc8550629ce18ec06385610151c8a8b4941e Mon Sep 17 00:00:00 2001
+From: Josh Hoffer <jhoffer@sansorgan.es>
+Date: Sat, 21 Nov 2026 13:09:03 -0800
+Subject: [RFC PATCH 2/3] usb: xhci: dbc: give ttyDBC its own Kconfig option
+
+The debug capability and its tty function share one option,
+USB_XHCI_DBGCAP, so DbC cannot be built without ttyDBC. Move the tty
+under USB_XHCI_DBGCAP_TTY, default y, so that existing configs keep it
+and another function can be built with or without it. The core calls
+into the tty only when it is built.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Signed-off-by: Josh Hoffer <jhoffer@sansorgan.es>
+---
+ drivers/usb/host/Kconfig       | 16 +++++++++++++---
+ drivers/usb/host/Makefile      |  3 ++-
+ drivers/usb/host/xhci-dbgcap.c | 12 +++++++++---
+ 3 files changed, 24 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/usb/host/Kconfig b/drivers/usb/host/Kconfig
+index 87103b8..4df3275 100644
+--- a/drivers/usb/host/Kconfig
++++ b/drivers/usb/host/Kconfig
+@@ -33,9 +33,19 @@ config USB_XHCI_DBGCAP
+ 	depends on TTY
+ 	help
+ 	  Say 'Y' to enable the support for the xHCI debug capability. Make
+-	  sure that your xHCI host supports the extended debug capability and
+-	  you want a TTY serial device based on the xHCI debug capability
+-	  before enabling this option. If unsure, say 'N'.
++	  sure that your xHCI host supports the extended debug capability,
++	  and choose what it presents to the debug host below. If unsure,
++	  say 'N'.
++
++config USB_XHCI_DBGCAP_TTY
++	bool "Debug capability as a TTY serial device (ttyDBC)"
++	depends on USB_XHCI_DBGCAP && TTY
++	default y
++	help
++	  The debug capability presents a TTY serial device, ttyDBC, as USB
++	  device 1d6b:0010. On the debug host, the usb_debug serial driver
++	  binds it as ttyUSB. It has been the debug capability's function
++	  from the start, so it defaults to on.
+ 
+ config USB_XHCI_PCI
+ 	tristate
+diff --git a/drivers/usb/host/Makefile b/drivers/usb/host/Makefile
+index 4df946c..c193614 100644
+--- a/drivers/usb/host/Makefile
++++ b/drivers/usb/host/Makefile
+@@ -16,7 +16,8 @@ xhci-hcd-y += xhci-ring.o xhci-hub.o xhci-dbg.o
+ xhci-hcd-y += xhci-trace.o
+ 
+ ifneq ($(CONFIG_USB_XHCI_DBGCAP), )
+-	xhci-hcd-y += xhci-dbgcap.o xhci-dbgtty.o
++	xhci-hcd-y += xhci-dbgcap.o
++	xhci-hcd-$(CONFIG_USB_XHCI_DBGCAP_TTY) += xhci-dbgtty.o
+ endif
+ 
+ xhci-mtk-hcd-y := xhci-mtk.o xhci-mtk-sch.o
+diff --git a/drivers/usb/host/xhci-dbgcap.c b/drivers/usb/host/xhci-dbgcap.c
+index 4945b51..6f25a2b 100644
+--- a/drivers/usb/host/xhci-dbgcap.c
++++ b/drivers/usb/host/xhci-dbgcap.c
+@@ -1372,7 +1372,10 @@ int xhci_create_dbc_dev(struct xhci_hcd *xhci)
+ 	if (xhci->dbc)
+ 		return -EBUSY;
+ 
+-	ret = xhci_dbc_tty_probe(dev, base + dbc_cap_offs, xhci);
++	if (IS_ENABLED(CONFIG_USB_XHCI_DBGCAP_TTY))
++		ret = xhci_dbc_tty_probe(dev, base + dbc_cap_offs, xhci);
++	else
++		ret = -ENODEV;
+ 
+ 	return ret;
+ }
+@@ -1433,10 +1436,13 @@ int xhci_dbc_resume(struct xhci_hcd *xhci)
+ 
+ int xhci_dbc_init(void)
+ {
+-	return dbc_tty_init();
++	if (IS_ENABLED(CONFIG_USB_XHCI_DBGCAP_TTY))
++		return dbc_tty_init();
++	return 0;
+ }
+ 
+ void xhci_dbc_exit(void)
+ {
+-	dbc_tty_exit();
++	if (IS_ENABLED(CONFIG_USB_XHCI_DBGCAP_TTY))
++		dbc_tty_exit();
+ }
+-- 
+2.56.0
+

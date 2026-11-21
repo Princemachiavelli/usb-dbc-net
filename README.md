@@ -30,10 +30,9 @@ Debug Capability (DbC).
     adds ttyDBC back, selectable with `xhci_hcd.dbc_net`.
 - **Debug host: `dbcnet.ko`** ([`kmod/dbcnet.c`](kmod/dbcnet.c)), a usbnet
   minidriver.
-  - It binds a `dbc_net` target by interface protocol `00`, where ttyDBC is
-    `01`.
-  - A udev rule ([`udev/90-dbcnet.rules`](udev/90-dbcnet.rules)) takes the
-    device back if `usb_debug` bound it first.
+  - `dbc_net` presents itself as `1d6b:0012` (provisional) where ttyDBC is
+    `1d6b:0010`. So `dbcnet.ko` autoloads for it, and `usb_debug` never
+    claims it.
 - **On NixOS:** use `nixosModules.target` on the target and
   `nixosModules.debug-host` on the host. `hardware.dbc-net.tty = true`
   keeps ttyDBC available on the target.
@@ -42,7 +41,8 @@ Debug Capability (DbC).
 
 These are the prototype, now the fallbacks:
 - **`dbcnet-host`** is the debug-host end without `dbcnet.ko`.
-  - It finds the DbC device by VID:PID (default `1d6b:0010`), takes the
+  - It finds the DbC device by VID:PID (by default `1d6b:0012`, `dbc_net`,
+    or `1d6b:0010`, ttyDBC), takes the
     interface from whichever driver holds it with libusb, and bridges its
     bulk endpoints to a TUN interface.
   - It reconnects when the device comes back.
@@ -56,7 +56,7 @@ These are the prototype, now the fallbacks:
   SuperSpeed companions.
   - It bridges to TUN the same way, standing in for real DbC hardware on
     `dummy_hcd`.
-  - `--protocol 0` makes it look like `dbc_net`.
+  - `--pid 0012 --protocol 0` makes it look like `dbc_net`.
 - All of them, and both kernel ends, use the same framing (`src/frame.h`):
   - a 4-byte header (magic, length) per IP packet, as a byte stream, so it
     also works through `/dev/ttyDBC0`;
@@ -88,8 +88,7 @@ both functions. It checks, in order:
    kernel:
    - the interface exists before DbC is enabled, without carrier;
    - enumeration at SuperSpeed;
-   - `dbcnet.ko` wins the device, and the udev rule takes it back from
-     `usb_debug`;
+   - `dbcnet.ko` autoloads for the device, and `usb_debug` can't bind it;
    - reconnects after DbC disable and after a cable unplug.
 2. **`dbc_net` + `dbcnet-host`:** the same target from userspace, and that
    the target needs the host's ZLP.
@@ -115,7 +114,7 @@ driver and no `dbc_net` parameter, and rebinding the controller brings
   DbC;
 - that turning the host's ZLP off breaks a 1024-byte frame;
 - reconnects;
-- `dbcnet.ko` against the impostor at protocol `00`.
+- `dbcnet.ko` against the impostor presenting as `dbc_net` (`1d6b:0012`).
 
 ## Hardware probe
 

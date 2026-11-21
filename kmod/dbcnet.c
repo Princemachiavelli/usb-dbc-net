@@ -3,10 +3,8 @@
  * dbcnet - the debug host's end of a network link over the xHCI Debug
  * Capability, as a usbnet minidriver.
  *
- * The target is Linux's dbc_net, which presents the DbC with interface
- * protocol 0 (vendor defined) where ttyDBC uses 1, so usb_debug and this
- * driver can tell the two apart; usb_debug matches on VID:PID alone, so this
- * driver must be registered first to win the device.
+ * The target is Linux's dbc_net, which presents the DbC as 1d6b:0012 where
+ * ttyDBC is 1d6b:0010 and usb_debug's. 0012 is provisional until assigned.
  *
  * The framing is dbc_net's: a 4-byte header per IP packet (magic 0xdb5e,
  * then the payload length, both big-endian), the frames forming a byte
@@ -24,11 +22,10 @@
 #include <linux/usb/usbnet.h>
 #include <linux/unaligned.h>
 
-/* The DbC interface: class Diagnostic Device, subclass 2, as the spec fixes. */
+#define DBCNET_VID		0x1d6b
+#define DBCNET_PID		0x0012
+/* The DbC interface's class, Diagnostic Device, as the spec fixes it. */
 #define DBCNET_CLASS		0xdc
-#define DBCNET_SUBCLASS		0x02
-/* dbc_net's bInterfaceProtocol; ttyDBC's is 1. */
-#define DBCNET_PROTOCOL		0x00
 #define DBCNET_MAGIC		0xdb5e
 #define DBCNET_HDR		4
 #define DBCNET_MAX_PAYLOAD	0xffff
@@ -276,9 +273,7 @@ static const struct driver_info dbcnet_info = {
 
 static const struct usb_device_id dbcnet_ids[] = {
 	{
-		USB_DEVICE_AND_INTERFACE_INFO(0x1d6b, 0x0010,
-					      DBCNET_CLASS, DBCNET_SUBCLASS,
-					      DBCNET_PROTOCOL),
+		USB_DEVICE_INTERFACE_CLASS(DBCNET_VID, DBCNET_PID, DBCNET_CLASS),
 		.driver_info = (unsigned long)&dbcnet_info,
 	},
 	{ },

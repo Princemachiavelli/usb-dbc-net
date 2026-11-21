@@ -1,8 +1,8 @@
 diff --git a/drivers/usb/host/Kconfig b/drivers/usb/host/Kconfig
-index 87103b8..ae756a8 100644
+index 87103b8..541efec 100644
 --- a/drivers/usb/host/Kconfig
 +++ b/drivers/usb/host/Kconfig
-@@ -30,12 +30,32 @@ config USB_XHCI_HCD
+@@ -30,12 +30,31 @@ config USB_XHCI_HCD
  if USB_XHCI_HCD
  config USB_XHCI_DBGCAP
  	bool "xHCI support for debug capability"
@@ -22,20 +22,19 @@ index 87103b8..ae756a8 100644
 +	depends on USB_XHCI_DBGCAP && TTY
 +	default y
 +	help
-+	  The debug capability presents a TTY serial device, ttyDBC, with
-+	  interface protocol 1 (GNU remote debug). On the debug host, the
-+	  usb_debug serial driver binds it as ttyUSB. This was the debug
-+	  capability's only function before USB_XHCI_DBGCAP_NET, so it
-+	  defaults to on.
++	  The debug capability presents a TTY serial device, ttyDBC, as USB
++	  device 1d6b:0010. On the debug host, the usb_debug serial driver
++	  binds it as ttyUSB. It has been the debug capability's function
++	  from the start, so it defaults to on.
 +
 +config USB_XHCI_DBGCAP_NET
 +	bool "Debug capability as a network interface (dbc_net)"
 +	depends on USB_XHCI_DBGCAP && NET
 +	help
 +	  The debug capability presents a raw IP network interface, dbcN,
-+	  with interface protocol 0 (vendor defined). With the TTY function
-+	  built too, the xhci_hcd.dbc_net parameter picks between them;
-+	  without it, this is the only function and needs no TTY layer.
++	  as USB device 1d6b:0012. With the TTY function built too, the
++	  xhci_hcd.dbc_net parameter picks between them; without it, this
++	  is the only function and needs no TTY layer.
  
  config USB_XHCI_PCI
  	tristate
@@ -143,10 +142,10 @@ index 5426c97..298d7f8 100644
  void xhci_dbc_remove(struct xhci_dbc *dbc);
 diff --git a/drivers/usb/host/xhci-dbgnet.c b/drivers/usb/host/xhci-dbgnet.c
 new file mode 100644
-index 0000000..29a76aa
+index 0000000..7afcfde
 --- /dev/null
 +++ b/drivers/usb/host/xhci-dbgnet.c
-@@ -0,0 +1,559 @@
+@@ -0,0 +1,564 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * xhci-dbgnet.c - a network interface over the xHCI debug capability
@@ -176,9 +175,13 @@ index 0000000..29a76aa
 +#include "xhci-dbgcap.h"
 +
 +/*
-+ * bInterfaceProtocol 0 is vendor defined; ttyDBC uses 1 (GNU Remote Debug).
-+ * It lets a debug host tell this function from the tty.
++ * The debug host tells this function apart by its product ID, as it does
++ * ttyDBC (0x0010) and the early printk console (0x0011). 0x0012 is
++ * provisional until assigned. The interface protocol is 0, vendor defined,
++ * since this is not GNU Remote Debug; it cannot identify the function on its
++ * own, as ttyDBC users may set it to 0 too.
 + */
++#define DBC_NET_PRODUCT_ID	0x0012
 +#define DBC_NET_PROTOCOL	0
 +#define DBC_NET_MAGIC		0xdb5e
 +#define DBC_NET_HDR		4
@@ -675,6 +678,7 @@ index 0000000..29a76aa
 +		goto err_free_netdev;
 +	}
 +	dbc->priv = net;
++	dbc->idProduct = DBC_NET_PRODUCT_ID;
 +	dbc->bInterfaceProtocol = DBC_NET_PROTOCOL;
 +	net->dbc = dbc;
 +

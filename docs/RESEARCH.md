@@ -285,9 +285,9 @@ dummy_hcd, not by anything real hardware would do.
    Status: phases 2–4 are built and tested against a DbC emulation in
    QEMU (`QEMU-DBC.md`, `KERNEL.md`). Two things differ from this plan:
    - DbC cannot send a ZLP, so the target pads instead.
-   - The function is chosen by a module parameter, and the target is told
-     apart from ttyDBC by interface protocol 0, not by a custom
-     `dbc_idProduct`.
+   - The function is chosen by a module parameter. As planned, the target
+     is told apart from ttyDBC by its own product ID, `1d6b:0012`
+     (provisional), not by sysfs.
 
    Phase 1, on real hardware, is still to do.
 3. **Pure USB 2.0 with no special cable is impossible.** Something has to be

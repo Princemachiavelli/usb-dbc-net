@@ -92,10 +92,11 @@ testers.runNixOSTest {
           mtu(9000)
           machine.succeed("systemctl stop iperf")
 
-      # The debug host's interface: the DbC device's one interface.
+      # The debug host's interface: the DbC device's one interface. The
+      # device is 1d6b:0012 for dbc_net, 1d6b:0010 for ttyDBC.
       def host_intf():
           return machine.succeed(
-              "basename $(dirname $(rg -lx 0010 /sys/bus/usb/devices/*/idProduct)):1.0"
+              "basename $(dirname $(rg -lx '001[02]' /sys/bus/usb/devices/*/idProduct)):1.0"
           ).strip()
 
       def host_driver():
@@ -120,7 +121,8 @@ testers.runNixOSTest {
               # dbc_net is the only function, so there is nothing to choose.
               machine.fail("test -e /sys/module/xhci_hcd/parameters/dbc_net")
               machine.fail("rg -q dbc_serial /proc/tty/drivers")
-          machine.succeed("test -d /sys/bus/usb/drivers/dbcnet")
+          # Nothing loads dbcnet.ko until a dbc_net device appears.
+          machine.fail("test -d /sys/bus/usb/drivers/dbcnet")
 
       with subtest("dbc_net is an interface before DbC is enabled, without carrier"):
           wait("ls /sys/bus/pci/devices/*/dbc")
@@ -133,15 +135,16 @@ testers.runNixOSTest {
           # DbC has no interrupts; the driver polls every 64 ms when idle.
           machine.succeed(f"echo 1 > {dbc('dbc_poll_interval_ms')}")
           machine.succeed(f"echo enable > {dbc('dbc')}")
-          wait("lsusb -d 1d6b:0010")
+          wait("lsusb -d 1d6b:0012")
           wait(f"test $(cat {dbc('dbc')}) = configured")
-          speed = device_speed("0010")
+          speed = device_speed("0012")
           assert speed == "5000", f"expected SuperSpeed, got {speed!r}"
-          print(machine.succeed("lsusb -v -d 1d6b:0010"))
+          print(machine.succeed("lsusb -v -d 1d6b:0012"))
 
-      with subtest("dbcnet.ko takes the dbc_net target, not usb_debug"):
+      with subtest("dbcnet.ko loads for the dbc_net target, and usb_debug stays out"):
           wait("test -e /sys/class/net/dbc0")
           assert host_driver() == "dbcnet", host_driver()
+          machine.fail("test -d /sys/bus/usb/drivers/usb_debug")
           link_up(TARGET, "10.77.0.1")
           host_link_up()
           assert carrier(TARGET)
@@ -158,22 +161,22 @@ testers.runNixOSTest {
       with subtest("throughput"):
           throughput("dbc_net + dbcnet.ko")
 
-      with subtest("usb_debug hands a dbc_net target over to dbcnet"):
+      # The product ID keeps them apart; no udev rule or load order needed.
+      with subtest("usb_debug cannot take a dbc_net target"):
           intf = host_intf()
           machine.succeed(
               f"echo {intf} > /sys/bus/usb/drivers/dbcnet/unbind",
               "modprobe usb_debug",
-              f"echo {intf} > /sys/bus/usb/drivers/usb_debug/bind",
           )
-          # The udev rule moves it back.
-          wait(f"test $(basename $(readlink -f /sys/bus/usb/devices/{intf}/driver)) = dbcnet")
+          machine.fail(f"echo {intf} > /sys/bus/usb/drivers/usb_debug/bind")
+          machine.succeed(f"echo {intf} > /sys/bus/usb/drivers/dbcnet/bind")
           host_link_up()
           wait("ping -c 1 -W 1 10.77.0.1")
 
       with subtest("the link comes back after DbC is disabled and re-enabled"):
           machine.succeed(f"echo disable > {dbc('dbc')}")
           wait("! test -e /sys/class/net/dbc0")
-          machine.fail("lsusb -d 1d6b:0010")
+          machine.fail("lsusb -d 1d6b:0012")
           assert not carrier(TARGET)
           machine.succeed(f"echo enable > {dbc('dbc')}")
           # The target's interface and address outlive the link; the host's
@@ -271,7 +274,7 @@ testers.runNixOSTest {
           machine.succeed(f"echo 1 > {dbc('dbc_poll_interval_ms')}")
           machine.succeed(f"echo enable > {dbc('dbc')}")
           wait(f"test $(cat {dbc('dbc')}) = configured")
-          # Protocol 01: usb_debug's, not dbcnet's.
+          # 1d6b:0010: usb_debug's, not dbcnet's.
           wait("test -c /dev/ttyDBC0 && test -c /dev/ttyUSB0")
           assert host_driver() == "usb_debug", host_driver()
 

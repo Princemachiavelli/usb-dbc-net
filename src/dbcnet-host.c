@@ -1,7 +1,8 @@
 /*
  * dbcnet-host: the debug-host end of a dbcnet link, in userspace. Finds the
- * DbC device by VID:PID, takes its bulk endpoints from usb_debug through
- * libusb, and bridges them to a TUN interface with the dbcnet stream framing.
+ * DbC device by VID:PID, takes its bulk endpoints from whichever driver holds
+ * them (usb_debug, dbcnet) through libusb, and bridges them to a TUN interface
+ * with the dbcnet stream framing.
  * The TUN interface outlives the device: when it goes away, we wait for it to
  * come back.
  */
@@ -27,8 +28,15 @@
  */
 #define OUT_TIMEOUT_MS 0
 
+/*
+ * Linux's DbC: 0012 is dbc_net (provisional, not yet assigned upstream),
+ * 0010 is ttyDBC. Without --pid, either will do.
+ */
+#define DBC_NET_PID 0x0012
+#define DBC_TTY_PID 0x0010
+
 static uint16_t opt_vid = 0x1d6b;
-static uint16_t opt_pid = 0x0010;
+static uint16_t opt_pid;
 static const char *opt_tun = "dbc0";
 static bool opt_zlp = true;
 
@@ -221,10 +229,20 @@ int main(int argc, char **argv)
 		fprintf(stderr, "dbcnet-host: libusb: %s\n", libusb_error_name(r));
 		return EXIT_FAILURE;
 	}
-	fprintf(stderr, "dbcnet-host: waiting for %04x:%04x\n", opt_vid, opt_pid);
+	if (opt_pid)
+		fprintf(stderr, "dbcnet-host: waiting for %04x:%04x\n", opt_vid, opt_pid);
+	else
+		fprintf(stderr, "dbcnet-host: waiting for %04x:%04x or %04x:%04x\n",
+			opt_vid, DBC_NET_PID, opt_vid, DBC_TTY_PID);
 	for (;;) {
-		libusb_device_handle *h =
-			libusb_open_device_with_vid_pid(ctx, opt_vid, opt_pid);
+		libusb_device_handle *h;
+		if (opt_pid) {
+			h = libusb_open_device_with_vid_pid(ctx, opt_vid, opt_pid);
+		} else {
+			h = libusb_open_device_with_vid_pid(ctx, opt_vid, DBC_NET_PID);
+			if (!h)
+				h = libusb_open_device_with_vid_pid(ctx, opt_vid, DBC_TTY_PID);
+		}
 		if (!h) {
 			usleep(POLL_MS * 1000);
 			continue;
