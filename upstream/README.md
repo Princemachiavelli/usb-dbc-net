@@ -16,8 +16,10 @@ builds the result, plus `dbcnet-host/`, in a full kernel tree.
 Not needed: a `usb_debug` change. With `dbc_net` on its own product ID,
 `usb_debug`'s match on 0010 and 0011 never sees it.
 
-Not here: QEMU's DbC emulation, on branch `dbc` of `~/srcs/qemu-dbc`, for
-qemu-devel.
+Not here: QEMU's DbC emulation, on branch `dbc` of `~/srcs/qemu-dbc`. QEMU
+can't take it as written: `docs/devel/code-provenance.rst` says the project
+declines contributions that include or derive from AI-generated content,
+naming Claude. It stays a local test fixture.
 
 Before sending:
 - **Rebase onto `usb-next`** (Greg KH's usb tree) and `net-next`, and
