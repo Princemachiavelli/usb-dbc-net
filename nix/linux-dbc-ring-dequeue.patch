@@ -1,0 +1,18 @@
+--- a/drivers/usb/host/xhci-dbgcap.c	2026-11-20 19:06:23.277878597 -0800
++++ b/drivers/usb/host/xhci-dbgcap.c	2026-11-20 19:06:28.166935521 -0800
+@@ -845,6 +845,15 @@
+ 		break;
+ 	}
+ 
++	/*
++	 * The xHC is done with this TRB and any No-op TRBs before it: move the
++	 * dequeue pointer past it, or xhci_num_trbs_free() never sees the
++	 * space come back and the ring fills after one lap.
++	 */
++	ring->dequeue = req->trb + 1;
++	if (TRB_TYPE_LINK_LE32(ring->dequeue->link.control))
++		ring->dequeue = ring->deq_seg->trbs;
++
+ 	req->actual = req->length - remain_length;
+ 	xhci_dbc_giveback(req, status);
+ }

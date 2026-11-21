@@ -9,8 +9,10 @@ Debug Capability (DbC).
 - [`docs/RESEARCH.md`](docs/RESEARCH.md) covers the options: bridge cables,
   xHCI DbC, USB4. It also covers prior art, why a VM can't play the device
   side, and the plan.
-- [`docs/QEMU-DBC.md`](docs/QEMU-DBC.md) scopes adding DbC emulation to QEMU,
-  so the real target-side kernel code can be tested in a VM.
+- [`docs/QEMU-DBC.md`](docs/QEMU-DBC.md) scopes DbC emulation for QEMU, so
+  the real target-side kernel code can be tested in a VM. It also records
+  the result: the emulation is built and running, and the bugs found while
+  building it.
 
 ## Userspace prototype (`src/`)
 
@@ -23,6 +25,11 @@ Debug Capability (DbC).
   `1d6b:0010`, one interface, and EP1 bulk OUT/IN at 1024 bytes with
   SuperSpeed companions. It bridges to TUN the same way. It stands in for
   real DbC hardware on `dummy_hcd`.
+- **`dbcnet-tty`** is the target end on real DbC.
+  - It bridges the kernel's `/dev/ttyDBC0` to TUN, and reopens the tty
+    after each disconnect.
+  - DbC cannot send a ZLP, so a batch ending on a 1024-byte boundary gets
+    a zero-length frame appended.
 - Both use the framing in `src/frame.h`:
   - a 4-byte header (magic, length) per IP packet, as a byte stream, so it
     also works through `/dev/ttyDBC0`
@@ -34,19 +41,38 @@ Debug Capability (DbC).
 ```
 nix build .#checks.x86_64-linux.dbcnet        # build + framing unit tests
 nix build -L .#checks.x86_64-linux.vm-impostor
+nix build -L .#checks.x86_64-linux.vm-dbc     # patched QEMU + guest kernel
 ```
 
-`vm-impostor` runs in one NixOS VM:
-- `dummy_hcd is_super_speed=1` + `raw_gadget`, with the impostor in a
-  `target` network namespace and `dbcnet-host` in the default namespace.
-- It checks:
-  - SuperSpeed enumeration, with `usb_debug` binding as it does on real DbC.
-  - Pings both ways at frame sizes 64–9004 bytes, including exact multiples
-    of 1024.
-  - iperf3 in both directions, reported but not asserted.
-  - That turning the host's ZLP off breaks a 1024-byte frame, so the test
-    really exercises the edge.
-  - That the host side reconnects after the device disappears.
+Both VM tests run in one NixOS VM, with the target end in a `target`
+network namespace and `dbcnet-host` in the default one. They share their
+checks (`nix/vm-common.py`):
+- pings both ways at frame sizes 64–9004 bytes, including exact multiples
+  of 1024
+- iperf3 in both directions, reported but not asserted
+- that the host side reconnects after the device disappears
+
+`vm-impostor` uses `dummy_hcd is_super_speed=1` + `raw_gadget`, with
+`dbc-impostor` as the target. It also checks that:
+- the device enumerates at SuperSpeed, with `usb_debug` binding as it does
+  on real DbC;
+- turning the host's ZLP off breaks a 1024-byte frame, so the test really
+  exercises the edge.
+
+`vm-dbc` runs the guest kernel's own DbC driver on emulated hardware:
+- QEMU with [`qemu/xhci-dbc.patch`](qemu/xhci-dbc.patch), which adds
+  `qemu-xhci,dbc=on` and a `usb-dbc-peer` cable end.
+- A kernel with `CONFIG_USB_XHCI_DBGCAP` and
+  [`nix/linux-dbc-ring-dequeue.patch`](nix/linux-dbc-ring-dequeue.patch),
+  a fix for DbC rings that fill after one lap on kernels after 6.12.
+- The target is ttyDBC bridged by `dbcnet-tty`.
+- It also checks:
+  - a raw ttyDBC0 ↔ ttyUSB0 transfer;
+  - a target that stops reading for 4 s mid-iperf, which must lose nothing;
+  - the padding that replaces the ZLP DbC cannot send;
+  - reconnects after DbC disable and after a cable unplug.
+
+See [`docs/QEMU-DBC.md`](docs/QEMU-DBC.md) for what the emulation found.
 
 ## Hardware probe
 

@@ -219,7 +219,7 @@ running in a guest can make a host-only port answer tokens on the wire.
   registers, just return 0 for now"). `usb-host` passthrough hands a
   *physical device* to a guest, which is the opposite direction.
   QEMU's emulated xHCI advertises only Supported-Protocol capabilities, not
-  DbC.
+  DbC. Upstream lacks it; we have since added it (`QEMU-DBC.md`).
 - **USB/IP with `usbip-vudc`** can export a gadget from one machine to
   another's host stack, but only over an *existing* IP network, so it is
   circular here.
@@ -243,7 +243,8 @@ special cable.
 - A VM only helps by keeping a crashing in-development driver off the
   workstation.
 - The target-side DbC netdev still needs real hardware, or DbC emulation in
-  QEMU (see `QEMU-DBC.md`).
+  QEMU. That emulation now exists as a patch, with its own VM test, in
+  `QEMU-DBC.md`.
 
 This rig is built as `nix/vm-impostor.nix` (see README). In a 2-vCPU VM the
 userspace prototype moved ~705 Mb/s host→target and ~556 Mb/s

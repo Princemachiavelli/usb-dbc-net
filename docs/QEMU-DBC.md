@@ -1,8 +1,103 @@
-# Adding the xHCI Debug Capability to QEMU: scoping
+# Adding the xHCI Debug Capability to QEMU
 
 Read against QEMU 11.1.2 `hw/usb/hcd-xhci.c` and Linux 7.3.4
-`drivers/usb/host/xhci-dbgcap.{c,h}` on 2026-11-20. Nothing here is built
-yet.
+`drivers/usb/host/xhci-dbgcap.{c,h}` on 2026-11-20. The scoping below was
+written first; the status section records what was then built.
+
+## Status
+
+Built as design A below, in [`qemu/xhci-dbc.patch`](../qemu/xhci-dbc.patch)
+against QEMU 11.1.2 (`nix/qemu-dbc.nix`). It adds about 1,000 lines, close
+to the estimate below:
+- a new `hw/usb/hcd-xhci-dbc.c` (~900 lines), holding the register block, event ring,
+  transfer engine and the `usb-dbc-peer` device;
+- hooks in `hcd-xhci.c` for the capability chain, realize/unrealize and
+  device reset, plus a `dbc` property, default off;
+- trace points `usb_xhci_dbc_*`.
+
+```
+-device qemu-xhci,id=dbct,dbc=on          # the target's controller
+-device qemu-xhci,id=dbch                  # the debug host's controller
+-device usb-dbc-peer,id=cable,dbc=dbct,bus=dbch.0
+```
+
+The peer stays detached while the guest has DbC disabled. On enable it
+enumerates with the guest's DCDDI identity and its info-context strings.
+`device_del cable` unplugs it; the guest sees CCS drop.
+
+`nix/vm-dbc.nix` runs the guest's own DbC driver against the emulation,
+with milestones 1 and 2 of the plan:
+- ttyDBC0 ↔ ttyUSB0 carries 1 MiB each way intact.
+- The `vm-impostor` checks run unchanged against ttyDBC: frames of
+  64–9004 bytes both ways and iperf3 both ways. A target that stops
+  reading for 4 s is checked too.
+  - `dbcnet-tty` (`src/dbcnet-tty.c`) bridges ttyDBC to TUN on the target.
+- The ZLP and padding cases, and reconnects after DbC disable/enable and
+  after a cable unplug.
+
+iperf3 through ttyDBC and `dbcnet-tty` gave 165–229 Mb/s, against about
+600–715 Mb/s for the impostor. The likely cause is ttyDBC: 16 requests
+of 1 KiB, a tty layer and a polled event loop, where the impostor moves
+32 KiB per read. That is not profiled yet. It is the case for milestone
+3's in-kernel `dbc_net`. Both ends share one VM, so the numbers are only
+indicative.
+
+### What building it found
+
+Three bugs (one each in the emulation's first cut, Linux and dbcnet) and
+one property the scoping predicted.
+
+1. **The emulation dropped events when the event ring looked full.**
+   - Linux's DbC event loop consumes events by cycle bit, and writes ERDP
+     only after the loop ends.
+   - Under steady traffic each completion leads to a requeue, a doorbell
+     and another completion, so the loop can run for hundreds of events on
+     a stale ERDP.
+   - The first cut checked for "full" against that ERDP and dropped the
+     event, and the guest then waited forever for those TRBs.
+   - It showed only under host load: iperf stalled about 2 s in.
+   - Now a TRB is taken only when the ring has room for its completion,
+     the other ring's TRB in progress and a port status change, and an ERDP
+     write resumes both rings. Real hardware also holds off rather than
+     lose an event.
+
+2. **A Linux regression: the DbC transfer rings fill after one lap.**
+   - 6.12 and earlier kept their own `num_trbs_free` counter in
+     `xhci-dbgcap.c`, which the transfer-event handler incremented.
+   - Later kernels check free space with the shared
+     `xhci_num_trbs_free()`, which compares enqueue with `ring->dequeue`.
+     Nothing in the DbC driver advances `dequeue`.
+   - So after about 254 TRBs per direction (~254 KiB through ttyDBC),
+     every queue fails with `failed to queue trbs` and ttyDBC goes quiet.
+   - Seen on 6.18.64; 7.3.4 has the same code, so real hardware should hit
+     it too.
+   - [`nix/linux-dbc-ring-dequeue.patch`](../nix/linux-dbc-ring-dequeue.patch)
+     advances `dequeue` past each completed TRB, and the test kernel
+     carries it. It is a candidate for upstream.
+3. **A dbcnet bug: abandoning a bulk OUT desynchronises the stream.**
+   - `dbcnet-host` used to give up on a bulk OUT after 2 s. By then the
+     target had already taken part of it, as real hardware does, packet by
+     packet.
+   - The target's decoder, now mid-frame, read the next batch as the rest
+     of that frame. With sparse traffic that looked like a dead link.
+   - Bug 1 stalls tripped that timeout. Pausing the target process (SIGSTOP
+     on `dbcnet-tty`, so ttyDBC throttles) reproduces it every time.
+   - Fix: bulk OUT has no timeout, so a stalled target NAKs until it
+     resumes, and an unplug still ends the transfer.
+   - `vm-dbc` now pauses the target for 4 s mid-iperf and then requires
+     exact-multiple frames both ways. The impostor can't take that check:
+     stopping it interrupts raw_gadget's ioctls, which drop partly filled
+     requests.
+4. **DbC never sends a zero-length packet**, as predicted below.
+   `dbcnet-tty` appends a zero-length frame whenever a batch ends on a
+   1024-byte boundary. `--no-pad` shows the reply arriving only at the
+   host's read timeout.
+
+Not done:
+- milestone 3, the in-kernel `dbc_net`;
+- migration (a blocker is registered);
+- endpoint halt (DbC never stalls, and `CLEAR_FEATURE(ENDPOINT_HALT)` is
+  acked).
 
 ## Why
 

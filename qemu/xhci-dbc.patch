@@ -1,0 +1,1104 @@
+diff --git a/hw/usb/hcd-xhci-dbc.c b/hw/usb/hcd-xhci-dbc.c
+new file mode 100644
+index 000000000..4b0808b3f
+--- /dev/null
++++ b/hw/usb/hcd-xhci-dbc.c
+@@ -0,0 +1,917 @@
++/*
++ * xHCI Debug Capability (DbC) emulation
++ *
++ * The Debug Capability (xHCI 1.2 section 7.6) lets a host controller present
++ * one of its root ports as a USB device to another host: the "debug host".
++ * The target's driver feeds it through a small register block, one event
++ * ring and two transfer rings, without interrupts.
++ *
++ * The cable's other end is the usb-dbc-peer device, plugged into any
++ * SuperSpeed port (usually of a second xHCI, standing in for the debug
++ * host). It is attached while the guest has DbC enabled and enumerates as
++ * the DbC device would: the identity the guest programmed into DCDDI1/2,
++ * its string descriptors from the DbC info context, and one interface with
++ * a bulk OUT and a bulk IN endpoint (EP1, 1024-byte packets).
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/error-report.h"
++#include "qemu/log.h"
++#include "qapi/error.h"
++#include "migration/blocker.h"
++#include "migration/vmstate.h"
++#include "hw/core/qdev-properties.h"
++#include "hw/usb/usb.h"
++#include "desc.h"
++#include "trace.h"
++#include "hcd-xhci.h"
++
++/* Register offsets within the capability (xHCI 1.2 section 7.6.8) */
++#define DCID            0x00
++#define DCDB            0x04
++#define DCERSTSZ        0x08
++#define DCERSTBA        0x10
++#define DCERSTBA_HI     0x14
++#define DCERDP          0x18
++#define DCERDP_HI       0x1c
++#define DCCTRL          0x20
++#define DCST            0x24
++#define DCPORTSC        0x28
++#define DCCP            0x30
++#define DCCP_HI         0x34
++#define DCDDI1          0x38
++#define DCDDI2          0x3c
++
++#define XHCI_EXT_CAPS_DEBUG 10
++
++#define DCCTRL_DCR      (1u << 0)
++#define DCCTRL_LSE      (1u << 1)
++#define DCCTRL_HOT      (1u << 2)
++#define DCCTRL_HIT      (1u << 3)
++#define DCCTRL_DRC      (1u << 4)
++#define DCCTRL_DCE      (1u << 31)
++
++#define DCPORTSC_CCS    (1u << 0)
++#define DCPORTSC_PED    (1u << 1)
++#define DCPORTSC_SUPER  (4u << 10)
++#define DCPORTSC_CSC    (1u << 17)
++#define DCPORTSC_PRC    (1u << 21)
++#define DCPORTSC_PLC    (1u << 22)
++#define DCPORTSC_CEC    (1u << 23)
++#define DCPORTSC_CHANGE (DCPORTSC_CSC | DCPORTSC_PRC | DCPORTSC_PLC | \
++                         DCPORTSC_CEC)
++
++/* DbC context: info context, then OUT and IN endpoint contexts */
++#define DBC_CTX_SIZE    64
++#define DBC_INFO_LENGTH 0x20
++#define DBC_EP_DEQ      0x08
++
++#define DBC_MAX_PACKET  1024
++
++#define TRB_SIZE        16
++#define TRB_C           (1u << 0)
++#define TRB_LK_TC       (1u << 1)
++#define TRB_TR_ISP      (1u << 2)
++#define TRB_TR_CH       (1u << 4)
++#define TRB_TR_IOC      (1u << 5)
++#define TRB_TYPE(c)     (((c) >> 10) & 0x3f)
++#define TRB_LEN(s)      ((s) & 0x1ffff)
++#define TRB_SKIP_LIMIT  4096
++
++/* endpoint IDs reported in transfer events, per ring */
++static const uint8_t dbc_epid[2] = { 2, 3 };
++
++#define TYPE_USB_DBC_PEER "usb-dbc-peer"
++OBJECT_DECLARE_SIMPLE_TYPE(USBDbCPeer, USB_DBC_PEER)
++
++struct USBDbCPeer {
++    USBDevice dev;
++    char *dbc;              /* id of the xHCI whose DbC this cable plugs into */
++    XHCIState *xhci;
++
++    /*
++     * The debug host's packet in flight per ring: on XHCI_DBC_OUT its bulk
++     * IN, filled from the target's OUT ring; on XHCI_DBC_IN its bulk OUT,
++     * drained into the IN ring.
++     */
++    USBPacket *pending[2];
++
++    USBDesc desc;
++    USBDescDevice desc_dev;
++    USBDescConfig desc_conf;
++    USBDescIface desc_iface;
++    USBDescEndpoint desc_eps[2];
++};
++
++static const char *const dbc_peer_strings[] = {
++    [1] = "QEMU",
++    [2] = "xHCI DbC",
++    [3] = "0",
++    [255] = NULL,
++};
++
++static GSList *dbc_controllers;
++static Error *dbc_migration_blocker;
++
++/* Event ring */
++
++static void dbc_load_erst(XHCIState *xhci)
++{
++    XHCIDbC *d = &xhci->dbc;
++    uint32_t seg[4];
++
++    d->er_start = 0;
++    d->er_size = 0;
++    d->er_idx = 0;
++    d->er_pcs = true;
++    if (!d->erstsz) {
++        return;
++    }
++    if (dma_memory_read(xhci->as, d->erstba, seg, sizeof(seg),
++                        MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
++        qemu_log_mask(LOG_GUEST_ERROR, "xhci-dbc: cannot read ERST\n");
++        return;
++    }
++    d->er_start = (le32_to_cpu(seg[0]) |
++                   ((uint64_t)le32_to_cpu(seg[1]) << 32)) & ~0x3fULL;
++    d->er_size = le32_to_cpu(seg[2]) & 0xffff;
++}
++
++/*
++ * Free event ring entries, as of the last ERDP the driver wrote. Linux
++ * writes ERDP only after it has drained the ring, which under steady
++ * traffic can be hundreds of events later.
++ */
++static uint32_t dbc_er_room(XHCIDbC *d)
++{
++    dma_addr_t erdp = d->erdp & ~0xfULL;
++    uint32_t deq;
++
++    if (!d->er_size) {
++        return 0;
++    }
++    if (erdp < d->er_start || erdp >= d->er_start + TRB_SIZE * d->er_size) {
++        return d->er_size - 1;
++    }
++    deq = (erdp - d->er_start) / TRB_SIZE;
++    return (deq + d->er_size - d->er_idx - 1) % d->er_size;
++}
++
++static void dbc_event(XHCIState *xhci, TRBType type, uint64_t param,
++                      uint32_t status, uint32_t flags)
++{
++    XHCIDbC *d = &xhci->dbc;
++    dma_addr_t addr;
++    uint32_t trb[3];
++    uint32_t control;
++
++    if (!d->er_size) {
++        return;
++    }
++    if (!dbc_er_room(d)) {
++        qemu_log_mask(LOG_GUEST_ERROR, "xhci-dbc: event ring full\n");
++        return;
++    }
++    trace_usb_xhci_dbc_event(type, param, status, d->er_idx);
++
++    addr = d->er_start + TRB_SIZE * d->er_idx;
++    trb[0] = cpu_to_le32(param);
++    trb[1] = cpu_to_le32(param >> 32);
++    trb[2] = cpu_to_le32(status);
++    control = flags | (type << 10) | (d->er_pcs ? TRB_C : 0);
++    /* The cycle bit hands the TRB over: write it last. */
++    dma_memory_write(xhci->as, addr, trb, sizeof(trb), MEMTXATTRS_UNSPECIFIED);
++    stl_le_dma(xhci->as, addr + 12, control, MEMTXATTRS_UNSPECIFIED);
++
++    if (++d->er_idx == d->er_size) {
++        d->er_idx = 0;
++        d->er_pcs = !d->er_pcs;
++    }
++}
++
++static void dbc_port_event(XHCIState *xhci)
++{
++    /* the debug port is port 1 */
++    dbc_event(xhci, ER_PORT_STATUS_CHANGE, 1ULL << 24, CC_SUCCESS << 24, 0);
++}
++
++/* Transfer rings */
++
++static void dbc_load_rings(XHCIState *xhci)
++{
++    XHCIDbC *d = &xhci->dbc;
++    uint64_t deq;
++    int r;
++
++    for (r = XHCI_DBC_OUT; r <= XHCI_DBC_IN; r++) {
++        ldq_le_dma(xhci->as, d->dccp + DBC_CTX_SIZE * (1 + r) + DBC_EP_DEQ,
++                   &deq, MEMTXATTRS_UNSPECIFIED);
++        d->ring[r].dequeue = deq & ~0xfULL;
++        d->ring[r].ccs = deq & 1;
++        d->trb[r].valid = false;
++    }
++}
++
++/* Makes the next Normal TRB on ring r current; false if the ring is empty. */
++static bool dbc_fetch(XHCIState *xhci, int r)
++{
++    XHCIRing *ring = &xhci->dbc.ring[r];
++    XHCIDbCTRB *t = &xhci->dbc.trb[r];
++    int i;
++
++    /*
++     * A full event ring holds transfers off rather than losing a completion:
++     * take a TRB only with room for its event, the other ring's TRB in
++     * progress and a port status change. An ERDP write resumes us.
++     */
++    if (dbc_er_room(&xhci->dbc) < 3) {
++        return false;
++    }
++
++    for (i = 0; i < TRB_SKIP_LIMIT; i++) {
++        uint32_t w[4];
++        uint64_t param;
++        uint32_t control;
++
++        if (dma_memory_read(xhci->as, ring->dequeue, w, sizeof(w),
++                            MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
++            qemu_log_mask(LOG_GUEST_ERROR, "xhci-dbc: cannot read TRB\n");
++            return false;
++        }
++        param = le32_to_cpu(w[0]) | ((uint64_t)le32_to_cpu(w[1]) << 32);
++        control = le32_to_cpu(w[3]);
++        if ((control & TRB_C) != ring->ccs) {
++            if (trace_event_get_state_backends(TRACE_USB_XHCI_DBC_MISS)) {
++                dma_addr_t a, found = 0;
++                uint32_t c;
++
++                for (a = ring->dequeue - 4096; a < ring->dequeue + 4096;
++                     a += TRB_SIZE) {
++                    ldl_le_dma(xhci->as, a + 12, &c, MEMTXATTRS_UNSPECIFIED);
++                    if (TRB_TYPE(c) == TR_NORMAL && (c & TRB_C) == ring->ccs) {
++                        found = a;
++                        break;
++                    }
++                }
++                trace_usb_xhci_dbc_miss(r, ring->dequeue, ring->ccs, control,
++                                        found);
++            }
++            return false;
++        }
++
++        switch (TRB_TYPE(control)) {
++        case TR_LINK:
++            ring->dequeue = param & ~0xfULL;
++            if (control & TRB_LK_TC) {
++                ring->ccs = !ring->ccs;
++            }
++            break;
++        case TR_NORMAL:
++            t->valid = true;
++            t->addr = ring->dequeue;
++            t->buf = param;
++            t->len = TRB_LEN(le32_to_cpu(w[2]));
++            t->done = 0;
++            t->control = control;
++            ring->dequeue += TRB_SIZE;
++            trace_usb_xhci_dbc_trb(r, t->addr, t->buf, t->len);
++            return true;
++        default:
++            /* No-op TRBs are requests the driver cancelled. */
++            ring->dequeue += TRB_SIZE;
++            break;
++        }
++    }
++    qemu_log_mask(LOG_GUEST_ERROR, "xhci-dbc: no Normal TRB within limit\n");
++    return false;
++}
++
++static void dbc_trb_complete(XHCIState *xhci, int r, TRBCCode cc)
++{
++    XHCIDbCTRB *t = &xhci->dbc.trb[r];
++
++    if ((t->control & TRB_TR_IOC) ||
++        (cc == CC_SHORT_PACKET && (t->control & TRB_TR_ISP))) {
++        dbc_event(xhci, ER_TRANSFER, t->addr,
++                  (t->len - t->done) | (cc << 24), dbc_epid[r] << 16);
++    }
++    t->valid = false;
++}
++
++/* Copies n bytes between the packet and guest memory at addr. */
++static void dbc_copy(XHCIState *xhci, USBPacket *p, dma_addr_t addr,
++                     uint32_t n)
++{
++    uint8_t buf[4096];
++
++    while (n) {
++        uint32_t c = MIN(n, sizeof(buf));
++
++        if (p->pid == USB_TOKEN_IN) {
++            dma_memory_read(xhci->as, addr, buf, c, MEMTXATTRS_UNSPECIFIED);
++            usb_packet_copy(p, buf, c);
++        } else {
++            usb_packet_copy(p, buf, c);
++            dma_memory_write(xhci->as, addr, buf, c, MEMTXATTRS_UNSPECIFIED);
++        }
++        addr += c;
++        n -= c;
++    }
++}
++
++/*
++ * Fills the debug host's bulk IN packet from the OUT ring. Each TD (here a
++ * TRB without the chain bit) is sent as packets of up to 1024 bytes; one
++ * ending on a short packet, or a zero-length TD, ends the host's transfer.
++ * One ending on a packet boundary leaves it open, as on the wire, until more
++ * data comes or the host's buffer is full. Returns true once p is complete.
++ */
++static bool dbc_to_host(XHCIState *xhci, USBPacket *p)
++{
++    XHCIDbCTRB *t = &xhci->dbc.trb[XHCI_DBC_OUT];
++
++    while (p->actual_length < p->iov.size) {
++        uint32_t n;
++
++        if (!t->valid && !dbc_fetch(xhci, XHCI_DBC_OUT)) {
++            return false;
++        }
++        n = MIN(p->iov.size - p->actual_length, t->len - t->done);
++        dbc_copy(xhci, p, t->buf + t->done, n);
++        t->done += n;
++        if (t->done == t->len) {
++            bool short_end = !(t->control & TRB_TR_CH) &&
++                             (t->len == 0 || t->len % DBC_MAX_PACKET);
++
++            dbc_trb_complete(xhci, XHCI_DBC_OUT, CC_SUCCESS);
++            if (short_end) {
++                return true;
++            }
++        }
++    }
++    return true;
++}
++
++/*
++ * Drains the debug host's bulk OUT packet into the IN ring. A transfer
++ * whose last packet is short (or a zero-length packet) completes the TRB it
++ * ends in with Short Packet; one ending on a packet boundary leaves that TRB
++ * open for the next transfer. Returns true once all of p is consumed.
++ */
++static bool dbc_from_host(XHCIState *xhci, USBPacket *p)
++{
++    XHCIDbCTRB *t = &xhci->dbc.trb[XHCI_DBC_IN];
++    bool short_xfer = p->iov.size % DBC_MAX_PACKET || p->iov.size == 0;
++
++    for (;;) {
++        uint32_t n, left;
++
++        if (!t->valid && !dbc_fetch(xhci, XHCI_DBC_IN)) {
++            return false;
++        }
++        n = MIN(p->iov.size - p->actual_length, t->len - t->done);
++        dbc_copy(xhci, p, t->buf + t->done, n);
++        t->done += n;
++        left = p->iov.size - p->actual_length;
++        if (t->done == t->len) {
++            dbc_trb_complete(xhci, XHCI_DBC_IN, CC_SUCCESS);
++        } else if (!left && short_xfer) {
++            dbc_trb_complete(xhci, XHCI_DBC_IN, CC_SHORT_PACKET);
++        }
++        if (!left) {
++            return true;
++        }
++    }
++}
++
++static bool dbc_transfer(XHCIState *xhci, int r, USBPacket *p)
++{
++    bool done = r == XHCI_DBC_OUT ? dbc_to_host(xhci, p)
++                                  : dbc_from_host(xhci, p);
++
++    trace_usb_xhci_dbc_packet(r, p->iov.size, p->actual_length, done);
++    return done;
++}
++
++static void dbc_kick(XHCIState *xhci, int r)
++{
++    USBDbCPeer *s = xhci->dbc.peer;
++    USBPacket *p;
++
++    if (!s || !(xhci->dbc.ctrl & DCCTRL_DCR)) {
++        return;
++    }
++    p = s->pending[r];
++    if (p && dbc_transfer(xhci, r, p)) {
++        s->pending[r] = NULL;
++        p->status = USB_RET_SUCCESS;
++        usb_packet_complete(&s->dev, p);
++    }
++}
++
++/* Port state */
++
++static void dbc_set_configured(XHCIState *xhci, bool configured)
++{
++    XHCIDbC *d = &xhci->dbc;
++
++    if (configured == !!(d->ctrl & DCCTRL_DCR)) {
++        return;
++    }
++    if (configured) {
++        dbc_load_rings(xhci);
++        d->ctrl |= DCCTRL_DCR;
++        trace_usb_xhci_dbc_state("configured");
++    } else {
++        d->ctrl &= ~DCCTRL_DCR;
++        trace_usb_xhci_dbc_state("unconfigured");
++    }
++    d->ctrl |= DCCTRL_DRC;
++}
++
++static void dbc_peer_load_string(USBDbCPeer *s, uint8_t index)
++{
++    XHCIState *xhci = s->xhci;
++    dma_addr_t ctx = xhci->dbc.dccp;
++    uint64_t addr;
++    uint32_t lens;
++    uint8_t raw[256];
++    char str[128];
++    size_t len, i, n = 0;
++
++    /* info context: string descriptor pointers, then their lengths */
++    ldq_le_dma(xhci->as, ctx + 8 * index, &addr, MEMTXATTRS_UNSPECIFIED);
++    ldl_le_dma(xhci->as, ctx + DBC_INFO_LENGTH, &lens, MEMTXATTRS_UNSPECIFIED);
++    len = (lens >> (8 * index)) & 0xff;
++    if (len < 2 || dma_memory_read(xhci->as, addr, raw, len,
++                                   MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
++        return;
++    }
++    /* UTF-16LE to the ASCII that usb_desc_set_string() takes */
++    for (i = 2; i + 1 < len && n < sizeof(str) - 1; i += 2) {
++        uint16_t c = raw[i] | (raw[i + 1] << 8);
++        str[n++] = c < 0x80 ? c : '?';
++    }
++    str[n] = '\0';
++    usb_desc_set_string(&s->dev, index, str);
++}
++
++/* Refreshes the peer's descriptors from what the guest programmed. */
++static void dbc_peer_load_desc(USBDbCPeer *s)
++{
++    XHCIDbC *d = &s->xhci->dbc;
++    uint8_t burst = (d->ctrl >> 16) & 0xff;
++    int i;
++
++    s->desc.id.idVendor = d->ddi1 >> 16;
++    s->desc.id.idProduct = d->ddi2 & 0xffff;
++    s->desc.id.bcdDevice = d->ddi2 >> 16;
++    s->desc_iface.bInterfaceProtocol = d->ddi1 & 0xff;
++    for (i = 0; i < 2; i++) {
++        s->desc_eps[i].bMaxBurst = burst;
++    }
++    for (i = 1; i <= 3; i++) {
++        dbc_peer_load_string(s, i);
++    }
++}
++
++static void dbc_connect(XHCIState *xhci)
++{
++    XHCIDbC *d = &xhci->dbc;
++    USBDbCPeer *s = d->peer;
++    Error *err = NULL;
++
++    if (!s || s->dev.attached) {
++        return;
++    }
++    dbc_peer_load_desc(s);
++    usb_device_attach(&s->dev, &err);
++    if (err) {
++        error_report_err(err);
++        return;
++    }
++    trace_usb_xhci_dbc_state("connected");
++    d->portsc = DCPORTSC_CCS | DCPORTSC_PED | DCPORTSC_SUPER | DCPORTSC_CSC;
++    dbc_port_event(xhci);
++}
++
++/* Unplugs the cable's device end, if attached; the port goes to idle. */
++static void dbc_disconnect(XHCIState *xhci)
++{
++    XHCIDbC *d = &xhci->dbc;
++    USBDbCPeer *s = d->peer;
++
++    if (s && s->dev.attached) {
++        usb_device_detach(&s->dev);
++    }
++    if (s) {
++        s->pending[XHCI_DBC_OUT] = NULL;
++        s->pending[XHCI_DBC_IN] = NULL;
++    }
++    dbc_set_configured(xhci, false);
++    d->trb[XHCI_DBC_OUT].valid = false;
++    d->trb[XHCI_DBC_IN].valid = false;
++    if (d->portsc & DCPORTSC_CCS) {
++        trace_usb_xhci_dbc_state("disconnected");
++        d->portsc = DCPORTSC_CSC;
++        dbc_port_event(xhci);
++    }
++}
++
++static void dbc_enable(XHCIState *xhci)
++{
++    trace_usb_xhci_dbc_state("enabled");
++    xhci->dbc.ctrl |= DCCTRL_DCE;
++    dbc_load_erst(xhci);
++    dbc_connect(xhci);
++}
++
++static void dbc_disable(XHCIState *xhci)
++{
++    XHCIDbC *d = &xhci->dbc;
++
++    trace_usb_xhci_dbc_state("disabled");
++    dbc_disconnect(xhci);
++    d->ctrl = 0;
++    d->portsc = 0;
++    d->er_size = 0;
++}
++
++/* Registers */
++
++static uint64_t dbc_read(void *opaque, hwaddr reg, unsigned size)
++{
++    XHCIState *xhci = opaque;
++    XHCIDbC *d = &xhci->dbc;
++    uint32_t ret = 0;
++
++    switch (reg) {
++    case DCID:
++        ret = XHCI_EXT_CAPS_DEBUG;  /* last capability; ERST max 2^0 */
++        break;
++    case DCERSTSZ:
++        ret = d->erstsz;
++        break;
++    case DCERSTBA:
++        ret = d->erstba;
++        break;
++    case DCERSTBA_HI:
++        ret = d->erstba >> 32;
++        break;
++    case DCERDP:
++        ret = d->erdp;
++        break;
++    case DCERDP_HI:
++        ret = d->erdp >> 32;
++        break;
++    case DCCTRL:
++        ret = d->ctrl;
++        if (d->peer && d->peer->dev.attached) {
++            ret |= (d->peer->dev.addr & 0x7f) << 24;
++        }
++        break;
++    case DCST:
++        /* debug port number 1; event ring not empty */
++        ret = 1u << 24;
++        if (d->er_size && d->er_idx != ((d->erdp & ~0xfULL) - d->er_start) /
++                                       TRB_SIZE) {
++            ret |= 1;
++        }
++        break;
++    case DCPORTSC:
++        ret = d->portsc;
++        break;
++    case DCCP:
++        ret = d->dccp;
++        break;
++    case DCCP_HI:
++        ret = d->dccp >> 32;
++        break;
++    case DCDDI1:
++        ret = d->ddi1;
++        break;
++    case DCDDI2:
++        ret = d->ddi2;
++        break;
++    }
++    trace_usb_xhci_dbc_read(reg, ret);
++    return ret;
++}
++
++static void dbc_write(void *opaque, hwaddr reg, uint64_t val, unsigned size)
++{
++    XHCIState *xhci = opaque;
++    XHCIDbC *d = &xhci->dbc;
++
++    trace_usb_xhci_dbc_write(reg, val);
++    switch (reg) {
++    case DCDB:
++        dbc_kick(xhci, (val >> 8) & 1);
++        break;
++    case DCERSTSZ:
++        d->erstsz = val & 0xffff;
++        break;
++    case DCERSTBA:
++        d->erstba = deposit64(d->erstba, 0, 32, val & ~0x3f);
++        break;
++    case DCERSTBA_HI:
++        d->erstba = deposit64(d->erstba, 32, 32, val);
++        break;
++    case DCERDP:
++        d->erdp = deposit64(d->erdp, 0, 32, val);
++        dbc_kick(xhci, XHCI_DBC_OUT);
++        dbc_kick(xhci, XHCI_DBC_IN);
++        break;
++    case DCERDP_HI:
++        d->erdp = deposit64(d->erdp, 32, 32, val);
++        dbc_kick(xhci, XHCI_DBC_OUT);
++        dbc_kick(xhci, XHCI_DBC_IN);
++        break;
++    case DCCTRL:
++        d->ctrl &= ~(val & (DCCTRL_DRC | DCCTRL_HOT | DCCTRL_HIT));
++        d->ctrl = (d->ctrl & ~DCCTRL_LSE) | (val & DCCTRL_LSE);
++        if ((val & DCCTRL_DCE) && !(d->ctrl & DCCTRL_DCE)) {
++            dbc_enable(xhci);
++        } else if (!(val & DCCTRL_DCE) && (d->ctrl & DCCTRL_DCE)) {
++            dbc_disable(xhci);
++        }
++        break;
++    case DCPORTSC:
++        d->portsc &= ~(val & DCPORTSC_CHANGE);
++        break;
++    case DCCP:
++        d->dccp = deposit64(d->dccp, 0, 32, val & ~0xf);
++        break;
++    case DCCP_HI:
++        d->dccp = deposit64(d->dccp, 32, 32, val);
++        break;
++    case DCDDI1:
++        d->ddi1 = val;
++        break;
++    case DCDDI2:
++        d->ddi2 = val;
++        break;
++    }
++}
++
++static const MemoryRegionOps dbc_ops = {
++    .read = dbc_read,
++    .write = dbc_write,
++    .valid.min_access_size = 4,
++    .valid.max_access_size = 8,
++    .impl.min_access_size = 4,
++    .impl.max_access_size = 4,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++};
++
++void xhci_dbc_realize(XHCIState *xhci, Error **errp)
++{
++    memory_region_init_io(&xhci->dbc.mem, OBJECT(xhci), &dbc_ops, xhci,
++                          "dbc", XHCI_DBC_LEN);
++    /* over the reserved part of the operational registers */
++    memory_region_add_subregion_overlap(&xhci->mem, XHCI_DBC_OFFSET,
++                                        &xhci->dbc.mem, 1);
++    if (!dbc_migration_blocker) {
++        error_setg(&dbc_migration_blocker,
++                   "xHCI Debug Capability state is not migratable");
++        if (migrate_add_blocker(&dbc_migration_blocker, errp) < 0) {
++            return;
++        }
++    }
++    dbc_controllers = g_slist_prepend(dbc_controllers, xhci);
++}
++
++void xhci_dbc_unrealize(XHCIState *xhci)
++{
++    dbc_disable(xhci);
++    if (xhci->dbc.peer) {
++        xhci->dbc.peer->xhci = NULL;
++        xhci->dbc.peer = NULL;
++    }
++    dbc_controllers = g_slist_remove(dbc_controllers, xhci);
++    memory_region_del_subregion(&xhci->mem, &xhci->dbc.mem);
++}
++
++void xhci_dbc_reset(XHCIState *xhci)
++{
++    XHCIDbC *d = &xhci->dbc;
++
++    dbc_disable(xhci);
++    d->erstsz = 0;
++    d->erstba = 0;
++    d->erdp = 0;
++    d->dccp = 0;
++    d->ddi1 = 0;
++    d->ddi2 = 0;
++}
++
++/* The cable's device end */
++
++static XHCIState *dbc_find(const char *id)
++{
++    GSList *l;
++
++    for (l = dbc_controllers; l; l = l->next) {
++        XHCIState *xhci = l->data;
++        DeviceState *host = xhci->hostOpaque;
++
++        if (!id || (host && host->id && !strcmp(host->id, id))) {
++            return xhci;
++        }
++    }
++    return NULL;
++}
++
++static void dbc_peer_handle_reset(USBDevice *dev)
++{
++    USBDbCPeer *s = USB_DBC_PEER(dev);
++    XHCIState *xhci = s->xhci;
++
++    s->pending[XHCI_DBC_OUT] = NULL;
++    s->pending[XHCI_DBC_IN] = NULL;
++    if (!xhci || !(xhci->dbc.portsc & DCPORTSC_CCS)) {
++        return;
++    }
++    /* A bus reset from the debug host returns DbC to its default state. */
++    dbc_set_configured(xhci, false);
++    xhci->dbc.trb[XHCI_DBC_OUT].valid = false;
++    xhci->dbc.trb[XHCI_DBC_IN].valid = false;
++    xhci->dbc.portsc |= DCPORTSC_PRC;
++    dbc_port_event(xhci);
++}
++
++static void dbc_peer_handle_control(USBDevice *dev, USBPacket *p,
++                                    int request, int value, int index,
++                                    int length, uint8_t *data)
++{
++    USBDbCPeer *s = USB_DBC_PEER(dev);
++    int ret;
++
++    ret = usb_desc_handle_control(dev, p, request, value, index, length,
++                                  data);
++    if (ret >= 0) {
++        if (request == (DeviceOutRequest | USB_REQ_SET_CONFIGURATION) &&
++            s->xhci) {
++            dbc_set_configured(s->xhci, value != 0);
++        }
++        return;
++    }
++
++    switch (request) {
++    case EndpointOutRequest | USB_REQ_CLEAR_FEATURE:
++        /* ENDPOINT_HALT: DbC never halts an endpoint on its own */
++        break;
++    default:
++        p->status = USB_RET_STALL;
++        break;
++    }
++}
++
++static void dbc_peer_handle_data(USBDevice *dev, USBPacket *p)
++{
++    USBDbCPeer *s = USB_DBC_PEER(dev);
++    XHCIState *xhci = s->xhci;
++    int r = p->pid == USB_TOKEN_IN ? XHCI_DBC_OUT : XHCI_DBC_IN;
++
++    if (!xhci || !(xhci->dbc.ctrl & DCCTRL_DCR) || p->ep->nr != 1 ||
++        s->pending[r]) {
++        p->status = USB_RET_STALL;
++        return;
++    }
++    if (dbc_transfer(xhci, r, p)) {
++        p->status = USB_RET_SUCCESS;
++        return;
++    }
++    /* Wait for the target to queue TRBs and ring the doorbell. */
++    p->status = USB_RET_ASYNC;
++    s->pending[r] = p;
++}
++
++static void dbc_peer_cancel_packet(USBDevice *dev, USBPacket *p)
++{
++    USBDbCPeer *s = USB_DBC_PEER(dev);
++    int r;
++
++    for (r = XHCI_DBC_OUT; r <= XHCI_DBC_IN; r++) {
++        if (s->pending[r] == p) {
++            s->pending[r] = NULL;
++        }
++    }
++}
++
++static void dbc_peer_realize(USBDevice *dev, Error **errp)
++{
++    USBDbCPeer *s = USB_DBC_PEER(dev);
++    XHCIState *xhci = dbc_find(s->dbc);
++    int i;
++
++    if (!xhci) {
++        error_setg(errp, "no xHCI with dbc=on%s%s", s->dbc ? " and id " : "",
++                   s->dbc ? s->dbc : "");
++        return;
++    }
++    if (xhci->dbc.peer) {
++        error_setg(errp, "that xHCI's Debug Capability already has a cable");
++        return;
++    }
++
++    for (i = 0; i < 2; i++) {
++        s->desc_eps[i] = (USBDescEndpoint) {
++            .bEndpointAddress = (i ? USB_DIR_IN : USB_DIR_OUT) | 1,
++            .bmAttributes = USB_ENDPOINT_XFER_BULK,
++            .wMaxPacketSize = DBC_MAX_PACKET,
++        };
++    }
++    s->desc_iface = (USBDescIface) {
++        .bNumEndpoints = 2,
++        .bInterfaceClass = 0xdc,        /* diagnostic */
++        .bInterfaceSubClass = 0x02,
++        .eps = s->desc_eps,
++    };
++    s->desc_conf = (USBDescConfig) {
++        .bNumInterfaces = 1,
++        .bConfigurationValue = 1,
++        .bmAttributes = USB_CFG_ATT_ONE | USB_CFG_ATT_SELFPOWER,
++        .nif = 1,
++        .ifs = &s->desc_iface,
++    };
++    s->desc_dev = (USBDescDevice) {
++        .bcdUSB = 0x0300,
++        .bMaxPacketSize0 = 9,
++        .bNumConfigurations = 1,
++        .confs = &s->desc_conf,
++    };
++    s->desc = (USBDesc) {
++        .id = { .iManufacturer = 1, .iProduct = 2, .iSerialNumber = 3 },
++        .super = &s->desc_dev,
++        .str = dbc_peer_strings,
++    };
++    dev->usb_desc = &s->desc;
++    usb_desc_init(dev);
++
++    /* Attached only while the guest has DbC enabled. */
++    dev->auto_attach = 0;
++    s->xhci = xhci;
++    xhci->dbc.peer = s;
++    if (xhci->dbc.ctrl & DCCTRL_DCE) {
++        dbc_connect(xhci);
++    }
++}
++
++static void dbc_peer_unrealize(USBDevice *dev)
++{
++    USBDbCPeer *s = USB_DBC_PEER(dev);
++    XHCIState *xhci = s->xhci;
++
++    if (!xhci) {
++        return;
++    }
++    /* the bus has detached the device already: the cable is unplugged */
++    dbc_disconnect(xhci);
++    xhci->dbc.peer = NULL;
++    s->xhci = NULL;
++}
++
++static const VMStateDescription vmstate_dbc_peer = {
++    .name = TYPE_USB_DBC_PEER,
++    .unmigratable = 1,
++};
++
++static const Property dbc_peer_properties[] = {
++    DEFINE_PROP_STRING("dbc", USBDbCPeer, dbc),
++};
++
++static void dbc_peer_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++    USBDeviceClass *uc = USB_DEVICE_CLASS(klass);
++
++    uc->realize = dbc_peer_realize;
++    uc->unrealize = dbc_peer_unrealize;
++    uc->product_desc = "xHCI DbC cable";
++    uc->handle_attach = usb_desc_attach;
++    uc->handle_reset = dbc_peer_handle_reset;
++    uc->handle_control = dbc_peer_handle_control;
++    uc->handle_data = dbc_peer_handle_data;
++    uc->cancel_packet = dbc_peer_cancel_packet;
++    dc->desc = "Device end of a USB 3 debug cable into an xHCI's DbC";
++    dc->vmsd = &vmstate_dbc_peer;
++    device_class_set_props(dc, dbc_peer_properties);
++    set_bit(DEVICE_CATEGORY_USB, dc->categories);
++}
++
++static const TypeInfo dbc_peer_info = {
++    .name = TYPE_USB_DBC_PEER,
++    .parent = TYPE_USB_DEVICE,
++    .instance_size = sizeof(USBDbCPeer),
++    .class_init = dbc_peer_class_init,
++};
++
++static void dbc_register_types(void)
++{
++    type_register_static(&dbc_peer_info);
++}
++
++type_init(dbc_register_types)
+diff --git a/hw/usb/hcd-xhci.c b/hw/usb/hcd-xhci.c
+index 624ce4ee7..485fd963c 100644
+--- a/hw/usb/hcd-xhci.c
++++ b/hw/usb/hcd-xhci.c
+@@ -2792,6 +2792,10 @@ static uint64_t xhci_cap_read(void *ptr, hwaddr reg, unsigned size)
+         break;
+     case 0x30: /* Supported Protocol:00 */
+         ret = 0x03000002; /* USB 3.0 */
++        if (xhci->dbc_enabled) {
++            /* next capability: the Debug Capability */
++            ret |= ((XHCI_DBC_OFFSET - 0x30) / 4) << 8;
++        }
+         break;
+     case 0x34: /* Supported Protocol:04 */
+         ret = 0x20425355; /* "USB " */
+@@ -3457,6 +3461,10 @@ static void usb_xhci_realize(DeviceState *dev, Error **errp)
+                               port->name, 0x10);
+         memory_region_add_subregion(&xhci->mem, offset, &port->mem);
+     }
++
++    if (xhci->dbc_enabled) {
++        xhci_dbc_realize(xhci, errp);
++    }
+ }
+ 
+ static void usb_xhci_unrealize(DeviceState *dev)
+@@ -3485,6 +3493,10 @@ static void usb_xhci_unrealize(DeviceState *dev)
+         memory_region_del_subregion(&xhci->mem, &port->mem);
+     }
+ 
++    if (xhci->dbc_enabled) {
++        xhci_dbc_unrealize(xhci);
++    }
++
+     usb_bus_release(&xhci->bus);
+ }
+ 
+@@ -3658,15 +3670,30 @@ static const Property xhci_properties[] = {
+     DEFINE_PROP_UINT32("p3",    XHCIState, numports_3, 4),
+     DEFINE_PROP_LINK("host",    XHCIState, hostOpaque, TYPE_DEVICE,
+                      DeviceState *),
++    DEFINE_PROP_BOOL("dbc",     XHCIState, dbc_enabled, false),
+ };
+ 
++/*
++ * A device reset also resets the Debug Capability; a controller reset
++ * (USBCMD.HCRST) does not, as the DbC runs independently of the xHC.
++ */
++static void xhci_device_reset(DeviceState *dev)
++{
++    XHCIState *xhci = XHCI(dev);
++
++    xhci_reset(dev);
++    if (xhci->dbc_enabled) {
++        xhci_dbc_reset(xhci);
++    }
++}
++
+ static void xhci_class_init(ObjectClass *klass, const void *data)
+ {
+     DeviceClass *dc = DEVICE_CLASS(klass);
+ 
+     dc->realize = usb_xhci_realize;
+     dc->unrealize = usb_xhci_unrealize;
+-    device_class_set_legacy_reset(dc, xhci_reset);
++    device_class_set_legacy_reset(dc, xhci_device_reset);
+     device_class_set_props(dc, xhci_properties);
+     dc->user_creatable = false;
+ }
+diff --git a/hw/usb/hcd-xhci.h b/hw/usb/hcd-xhci.h
+index 5cb9e06d1..b257e8a36 100644
+--- a/hw/usb/hcd-xhci.h
++++ b/hw/usb/hcd-xhci.h
+@@ -172,6 +172,57 @@ typedef struct XHCIInterrupter {
+ 
+ } XHCIInterrupter;
+ 
++/*
++ * Debug Capability (xHCI 1.2 section 7.6), placed in the reserved part of
++ * the operational register block so the extended capability chain can
++ * reach it from the Supported Protocol capabilities.
++ */
++#define XHCI_DBC_OFFSET 0x400
++#define XHCI_DBC_LEN    0x40
++
++/* DbC transfer rings, named as the target's driver sees them. */
++enum {
++    XHCI_DBC_OUT = 0,   /* target -> debug host, doorbell target 0 */
++    XHCI_DBC_IN  = 1,   /* debug host -> target, doorbell target 1 */
++};
++
++typedef struct XHCIDbCTRB {
++    bool valid;
++    dma_addr_t addr;    /* of the TRB itself, for its transfer event */
++    uint64_t buf;
++    uint32_t len;
++    uint32_t done;
++    uint32_t control;
++} XHCIDbCTRB;
++
++struct USBDbCPeer;
++
++typedef struct XHCIDbC {
++    MemoryRegion mem;
++
++    /* registers */
++    uint32_t erstsz;
++    uint64_t erstba;
++    uint64_t erdp;
++    uint32_t ctrl;
++    uint32_t portsc;
++    uint64_t dccp;
++    uint32_t ddi1;
++    uint32_t ddi2;
++
++    /* event ring */
++    dma_addr_t er_start;
++    uint32_t er_size;
++    uint32_t er_idx;
++    bool er_pcs;
++
++    XHCIRing ring[2];
++    XHCIDbCTRB trb[2];
++
++    /* the device end of the debug cable, if one is plugged in */
++    struct USBDbCPeer *peer;
++} XHCIDbC;
++
+ typedef struct XHCIState {
+     DeviceState parent;
+ 
+@@ -223,9 +274,16 @@ typedef struct XHCIState {
+     XHCIRing cmd_ring;
+ 
+     bool nec_quirks;
++
++    bool dbc_enabled;   /* property "dbc" */
++    XHCIDbC dbc;
+ } XHCIState;
+ 
+ extern const VMStateDescription vmstate_xhci;
+ bool xhci_get_flag(XHCIState *xhci, enum xhci_flags bit);
+ void xhci_set_flag(XHCIState *xhci, enum xhci_flags bit);
++
++void xhci_dbc_realize(XHCIState *xhci, Error **errp);
++void xhci_dbc_unrealize(XHCIState *xhci);
++void xhci_dbc_reset(XHCIState *xhci);
+ #endif
+diff --git a/hw/usb/meson.build b/hw/usb/meson.build
+index ba55c28ef..123def24d 100644
+--- a/hw/usb/meson.build
++++ b/hw/usb/meson.build
+@@ -20,7 +20,7 @@ system_ss.add(when: 'CONFIG_USB_OHCI_SYSBUS', if_true: files('hcd-ohci-sysbus.c'
+ system_ss.add(when: 'CONFIG_USB_EHCI', if_true: files('hcd-ehci.c'))
+ system_ss.add(when: 'CONFIG_USB_EHCI_PCI', if_true: files('hcd-ehci-pci.c'))
+ system_ss.add(when: 'CONFIG_USB_EHCI_SYSBUS', if_true: files('hcd-ehci-sysbus.c'))
+-system_ss.add(when: 'CONFIG_USB_XHCI', if_true: files('hcd-xhci.c'))
++system_ss.add(when: 'CONFIG_USB_XHCI', if_true: files('hcd-xhci.c', 'hcd-xhci-dbc.c'))
+ system_ss.add(when: 'CONFIG_USB_XHCI_PCI', if_true: files('hcd-xhci-pci.c'))
+ system_ss.add(when: 'CONFIG_USB_XHCI_SYSBUS', if_true: files('hcd-xhci-sysbus.c'))
+ system_ss.add(when: 'CONFIG_USB_XHCI_NEC', if_true: files('hcd-xhci-nec.c'))
+diff --git a/hw/usb/trace-events b/hw/usb/trace-events
+index 0d4318dcf..df1c7f756 100644
+--- a/hw/usb/trace-events
++++ b/hw/usb/trace-events
+@@ -147,6 +147,15 @@ usb_uhci_td_nextqh(uint32_t qh, uint32_t td) "qh 0x%x, td 0x%x"
+ usb_uhci_td_async(uint32_t qh, uint32_t td) "qh 0x%x, td 0x%x"
+ usb_uhci_td_complete(uint32_t qh, uint32_t td) "qh 0x%x, td 0x%x"
+ 
++# hcd-xhci-dbc.c
++usb_xhci_dbc_read(uint32_t off, uint32_t val) "off 0x%02x ret 0x%08x"
++usb_xhci_dbc_write(uint32_t off, uint32_t val) "off 0x%02x val 0x%08x"
++usb_xhci_dbc_state(const char *what) "%s"
++usb_xhci_dbc_trb(int ring, uint64_t addr, uint64_t buf, uint32_t len) "ring %d trb 0x%" PRIx64 " buf 0x%" PRIx64 " len %u"
++usb_xhci_dbc_event(uint32_t type, uint64_t param, uint32_t status, uint32_t idx) "type %u param 0x%" PRIx64 " status 0x%08x at %u"
++usb_xhci_dbc_packet(int ring, uint32_t size, uint32_t actual, int done) "ring %d size %u actual %u done %d"
++usb_xhci_dbc_miss(int ring, uint64_t deq, int ccs, uint32_t control, uint64_t owned) "ring %d deq 0x%" PRIx64 " ccs %d control 0x%08x first owned 0x%" PRIx64
++
+ # hcd-xhci.c
+ usb_xhci_reset(void) "=== RESET ==="
+ usb_xhci_exit(void) "=== EXIT ==="

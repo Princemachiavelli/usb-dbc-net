@@ -8,11 +8,14 @@ LDFLAGS += -pthread
 LIBUSB_CFLAGS = $(shell $(PKG_CONFIG) --cflags libusb-1.0)
 LIBUSB_LIBS = $(shell $(PKG_CONFIG) --libs libusb-1.0)
 
-PROGRAMS = dbc-impostor dbcnet-host
+PROGRAMS = dbc-impostor dbcnet-host dbcnet-tty
 
 all: $(PROGRAMS)
 
 dbc-impostor: dbc-impostor.o frame.o
+	$(CC) $(LDFLAGS) -o $@ $^
+
+dbcnet-tty: dbcnet-tty.o frame.o
 	$(CC) $(LDFLAGS) -o $@ $^
 
 dbcnet-host: dbcnet-host.o frame.o

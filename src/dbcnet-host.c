@@ -19,7 +19,13 @@
 #include <unistd.h>
 
 #define POLL_MS 200
-#define OUT_TIMEOUT_MS 2000
+/*
+ * No timeout on bulk OUT: a transfer the device has partly taken cannot be
+ * taken back, and abandoning it would leave the receiver mid-frame, reading
+ * the next batch as the rest of it. A device that stops reading NAKs until it
+ * resumes; one that goes away ends the transfer with NO_DEVICE.
+ */
+#define OUT_TIMEOUT_MS 0
 
 static uint16_t opt_vid = 0x1d6b;
 static uint16_t opt_pid = 0x0010;
@@ -121,10 +127,7 @@ static void *tx_thread(void *arg)
 		if (n == 0)
 			continue;
 		int r = bulk_out(s, batch.buf, n);
-		if (r == LIBUSB_ERROR_TIMEOUT) {
-			/* The receiver resynchronises if part of the batch went. */
-			fprintf(stderr, "dbcnet-host: bulk out timed out\n");
-		} else if (r < 0) {
+		if (r < 0) {
 			fprintf(stderr, "dbcnet-host: bulk out: %s\n",
 				libusb_error_name(r));
 			s->dead = true;
