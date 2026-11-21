@@ -79,8 +79,12 @@ Before sending, which only you can do:
     co-author's `Signed-off-by:`, which an AI may not add.
   - The disclosure the rules ask for is already in each changelog, so
     dropping the trailer would lose nothing.
-- **Rebase onto `usb-next` and `net-next`** if they have moved past
-  mainline.
+- **Re-check against `usb-next` and `net-next` just before sending.** As of
+  2026-11-21:
+  - `usb-next` matches 7.4-rc3 byte for byte in every file `fixes/` and
+    `dbc-net/` touch;
+  - `dbcnet-host/` applies to `net-next` with line offsets only. `net-next`
+    split the ax88179 driver.
 - **Decide on a MAINTAINERS entry** for `dbcnet.c` and `xhci-dbgnet.c`.
   One would name you.
 - **Find the recipients** with `scripts/get_maintainer.pl`:
