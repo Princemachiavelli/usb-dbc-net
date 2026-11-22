@@ -1,0 +1,166 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Josh Hoffer <jhoffer@sansorgan.es>
+Date: Sat, 21 Nov 2026 16:18:30 -0800
+Subject: [RFC PATCH 3/5] tests/qtest/usb-hcd-xhci-test: split starting QEMU
+ from running xHCI
+
+xhci_test_start() starts QEMU, runs the controller and addresses the
+device on the first connected port, all in one. Split it into
+xhci_test_init(), xhci_test_run() and xhci_address_device(), and keep
+the DCBAA and ep0 ring in XHCITest, so that a test can set up another
+device before the controller runs, and address a device again after it
+reconnects. No change to the existing tests.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ tests/qtest/usb-hcd-xhci-test.c | 96 +++++++++++++++++++++------------
+ 1 file changed, 61 insertions(+), 35 deletions(-)
+
+diff --git a/tests/qtest/usb-hcd-xhci-test.c b/tests/qtest/usb-hcd-xhci-test.c
+index 2e173af75..14010384d 100644
+--- a/tests/qtest/usb-hcd-xhci-test.c
++++ b/tests/qtest/usb-hcd-xhci-test.c
+@@ -69,8 +69,8 @@ typedef struct XHCITest {
+     QPCIBus *bus;
+     struct qhc hc;
+     uint32_t oper, runtime, doorbell;
+-    uint64_t cmd_ring, event_ring, input_ctx;
+-    unsigned int cmd_idx, event_idx;
++    uint64_t dcbaa, cmd_ring, event_ring, input_ctx, ep0_ring;
++    unsigned int cmd_idx, event_idx, ep0_idx;
+     unsigned int port, slot;
+ } XHCITest;
+ 
+@@ -240,19 +240,20 @@ static unsigned int xhci_command(XHCITest *x, uint64_t parameter,
+     return TRB_GET_SLOT(control);
+ }
+ 
+-/*
+- * Start qemu-xhci with one USB device, run the controller and bring the
+- * device to the Addressed state.
+- */
+-static void xhci_test_start(XHCITest *x, const char *usb_device)
++static char *xhci_test_cmdline(const char *args)
+ {
+-    uint64_t dcbaa, erst, ep0_ring;
+-    unsigned int maxports;
++    /* pit=off: a long clock step would run the i8254 timer all the way */
++    return g_strdup_printf("-machine pc,pit=off -nodefaults "
++                           "-device qemu-xhci,id=xhci,addr=04.0 %s", args);
++}
++
++/* Start QEMU with qemu-xhci and the given devices; the controller is idle. */
++static void xhci_test_init(XHCITest *x, const char *args)
++{
++    g_autofree char *cmdline = xhci_test_cmdline(args);
+ 
+     memset(x, 0, sizeof(*x));
+-    /* pit=off: a long clock step would run the i8254 timer all the way */
+-    x->qts = qtest_initf("-machine pc,pit=off -nodefaults "
+-                         "-device qemu-xhci,id=xhci,addr=04.0 %s", usb_device);
++    x->qts = qtest_init(cmdline);
+     pc_alloc_init(&x->alloc, x->qts, ALLOC_NO_FLAGS);
+     x->bus = qpci_new_pc(x->qts, NULL);
+     qusb_pci_init_one(x->bus, &x->hc, QPCI_DEVFN(4, 0), 0);
+@@ -260,27 +261,12 @@ static void xhci_test_start(XHCITest *x, const char *usb_device)
+     x->oper = qpci_io_readb(x->hc.dev, x->hc.bar, XHCI_CAPLENGTH);
+     x->runtime = xhci_readl(x, XHCI_RTSOFF) & ~0x1f;
+     x->doorbell = xhci_readl(x, XHCI_DBOFF) & ~0x3;
+-    maxports = xhci_readl(x, XHCI_HCSPARAMS1) >> 24;
+-
+-    xhci_writel(x, x->oper + XHCI_USBCMD, USBCMD_HCRST);
+-    g_assert_false(xhci_readl(x, x->oper + XHCI_USBCMD) & USBCMD_HCRST);
+-
+-    dcbaa = xhci_alloc_page(x);
+-    erst = xhci_alloc_page(x);
+-    x->cmd_ring = xhci_alloc_page(x);
+-    x->event_ring = xhci_alloc_page(x);
+-    x->input_ctx = xhci_alloc_page(x);
++}
+ 
+-    xhci_writel(x, x->oper + XHCI_CONFIG, 1);
+-    xhci_writeq(x, x->oper + XHCI_DCBAAP, dcbaa);
+-    qtest_writeq(x->qts, erst, x->event_ring);
+-    qtest_writel(x->qts, erst + 8, XHCI_RING_TRBS);
+-    xhci_writel(x, x->runtime + XHCI_ERSTSZ, 1);
+-    xhci_writeq(x, x->runtime + XHCI_ERSTBA, erst);
+-    xhci_writeq(x, x->runtime + XHCI_ERDP, x->event_ring | ERDP_EHB);
+-    xhci_writeq(x, x->oper + XHCI_CRCR, x->cmd_ring | CRCR_RCS);
+-    xhci_writel(x, x->oper + XHCI_USBCMD, USBCMD_RS);
+-    g_assert_false(xhci_readl(x, x->oper + XHCI_USBSTS) & USBSTS_HCH);
++/* Bring the device on the first connected port to the Addressed state. */
++static void xhci_address_device(XHCITest *x)
++{
++    unsigned int maxports = xhci_readl(x, XHCI_HCSPARAMS1) >> 24;
+ 
+     for (x->port = 0; x->port < maxports; x->port++) {
+         if (xhci_readl(x, x->oper + XHCI_PORTSC(x->port)) & PORTSC_CCS) {
+@@ -294,22 +280,62 @@ static void xhci_test_start(XHCITest *x, const char *usb_device)
+     }
+ 
+     x->slot = xhci_command(x, 0, TRB_TYPE(CR_ENABLE_SLOT));
+-    qtest_writeq(x->qts, dcbaa + 8 * x->slot, xhci_alloc_page(x));
++    qtest_writeq(x->qts, x->dcbaa + 8 * x->slot, xhci_alloc_page(x));
+ 
+     /* input control context: add slot and ep0 */
++    qtest_memset(x->qts, x->input_ctx, 0, 0x1000);
+     qtest_writel(x->qts, x->input_ctx + 0x04, 0x3);
+     /* slot context: one context entry, root hub port */
+     qtest_writel(x->qts, x->input_ctx + 0x20, 1 << 27);
+     qtest_writel(x->qts, x->input_ctx + 0x24, (x->port + 1) << 16);
+     /* ep0 context */
+-    ep0_ring = xhci_alloc_page(x);
++    x->ep0_ring = xhci_alloc_page(x);
++    x->ep0_idx = 0;
+     qtest_writel(x->qts, x->input_ctx + 0x44,
+                  (64 << 16) | (EP_TYPE_CONTROL << 3));
+-    qtest_writeq(x->qts, x->input_ctx + 0x48, ep0_ring | 1);
++    qtest_writeq(x->qts, x->input_ctx + 0x48, x->ep0_ring | 1);
+     xhci_command(x, x->input_ctx,
+                  TRB_TYPE(CR_ADDRESS_DEVICE) | (x->slot << 24));
+ }
+ 
++/* Run the controller, then address the device on the first connected port. */
++static void xhci_test_run(XHCITest *x)
++{
++    uint64_t erst;
++
++    xhci_writel(x, x->oper + XHCI_USBCMD, USBCMD_HCRST);
++    g_assert_false(xhci_readl(x, x->oper + XHCI_USBCMD) & USBCMD_HCRST);
++
++    x->dcbaa = xhci_alloc_page(x);
++    erst = xhci_alloc_page(x);
++    x->cmd_ring = xhci_alloc_page(x);
++    x->event_ring = xhci_alloc_page(x);
++    x->input_ctx = xhci_alloc_page(x);
++
++    xhci_writel(x, x->oper + XHCI_CONFIG, 1);
++    xhci_writeq(x, x->oper + XHCI_DCBAAP, x->dcbaa);
++    qtest_writeq(x->qts, erst, x->event_ring);
++    qtest_writel(x->qts, erst + 8, XHCI_RING_TRBS);
++    xhci_writel(x, x->runtime + XHCI_ERSTSZ, 1);
++    xhci_writeq(x, x->runtime + XHCI_ERSTBA, erst);
++    xhci_writeq(x, x->runtime + XHCI_ERDP, x->event_ring | ERDP_EHB);
++    xhci_writeq(x, x->oper + XHCI_CRCR, x->cmd_ring | CRCR_RCS);
++    xhci_writel(x, x->oper + XHCI_USBCMD, USBCMD_RS);
++    g_assert_false(xhci_readl(x, x->oper + XHCI_USBSTS) & USBSTS_HCH);
++
++    xhci_address_device(x);
++}
++
++/*
++ * Start qemu-xhci with one USB device, run the controller and bring the
++ * device to the Addressed state.
++ */
++static void xhci_test_start(XHCITest *x, const char *usb_device)
++{
++    xhci_test_init(x, usb_device);
++    xhci_test_run(x);
++}
++
+ /* Returns the address of the transfer ring. */
+ static uint64_t xhci_configure_ep(XHCITest *x, unsigned int epid,
+                                   unsigned int type, unsigned int interval,
+-- 
+2.56.0
+

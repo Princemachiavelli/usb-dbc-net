@@ -1,0 +1,56 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Josh Hoffer <jhoffer@sansorgan.es>
+Date: Sat, 21 Nov 2026 16:18:30 -0800
+Subject: [RFC PATCH 5/5] docs/system/devices/usb: document the xHCI Debug
+ Capability
+
+Describe qemu-xhci's dbc property and usb-dbc-peer, with an example,
+and what happens to the cable on migration.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ docs/system/devices/usb.rst | 28 ++++++++++++++++++++++++++++
+ 1 file changed, 28 insertions(+)
+
+diff --git a/docs/system/devices/usb.rst b/docs/system/devices/usb.rst
+index dc694d23c..1986278a6 100644
+--- a/docs/system/devices/usb.rst
++++ b/docs/system/devices/usb.rst
+@@ -25,6 +25,34 @@ only controller you need.  With only a single USB controller (and
+ therefore only a single USB bus) present in the system there is no
+ need to use the bus= parameter when adding USB devices.
+ 
++XHCI Debug Capability
++^^^^^^^^^^^^^^^^^^^^^
++
++The xHCI Debug Capability (DbC, xHCI 1.2 section 7.6) lets a host
++controller present one of its ports as a USB device to another host, the
++debug host, over a USB 3 debug cable. Linux uses it for ``ttyDBC`` and
++for early console output. With ``dbc=on``, ``qemu-xhci`` offers the
++capability to its guest:
++
++.. parsed-literal::
++
++    |qemu_system| -device qemu-xhci,id=target,dbc=on \\
++                  -device qemu-xhci,id=debughost \\
++                  -device usb-dbc-peer,dbc=target,bus=debughost.0
++
++``usb-dbc-peer`` is the cable's other end: a USB device, on any USB bus,
++here on a second controller standing in for the debug host. Its ``dbc``
++property names the controller whose Debug Capability it plugs into, and
++each such controller takes one cable. The device is attached only while
++the guest has DbC enabled. It enumerates with the vendor, product and
++strings the guest programmed, with one interface and a bulk endpoint in
++each direction.
++
++Migration keeps the Debug Capability's state, so DbC stays enabled in
++the guest. The debug host's controller does not migrate the transfers it
++had in flight to the cable, though, so after a migration the cable is
++unplugged and plugged back in, and both ends see a reconnect.
++
+ 
+ EHCI controller support
+ ^^^^^^^^^^^^^^^^^^^^^^^
+-- 
+2.56.0
+

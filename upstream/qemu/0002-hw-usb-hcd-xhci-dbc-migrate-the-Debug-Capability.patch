@@ -1,0 +1,282 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Josh Hoffer <jhoffer@sansorgan.es>
+Date: Sat, 21 Nov 2026 16:18:30 -0800
+Subject: [RFC PATCH 2/5] hw/usb/hcd-xhci-dbc: migrate the Debug Capability
+
+Migrate the DbC registers, its event ring, and its two transfer rings
+with the TRB each has in progress, in a subsection of the xHCI state
+sent when the controller has dbc=on, and drop the migration blocker.
+
+The debug host's controller does not migrate the transfers it had in
+flight to usb-dbc-peer, and moves its rings past them. So, as usb-host
+does with its device, the peer unplugs the cable after loading and
+plugs it back in 100 ms later. The guest sees DbC stay enabled, a
+disconnect and a connect, and the debug host enumerates the cable again.
+A TRB that was partly transferred is given up with the unplug, as on
+real hardware, and never completes; the guest's driver requeues.
+
+The peer's speed is not migrated, and the debug host's controller needs
+it to find the port to detach, so post_load picks it as attaching does.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/usb/hcd-xhci-dbc.c | 148 +++++++++++++++++++++++++++++++++++++++---
+ hw/usb/hcd-xhci.c     |   4 ++
+ hw/usb/hcd-xhci.h     |   1 +
+ 3 files changed, 143 insertions(+), 10 deletions(-)
+
+diff --git a/hw/usb/hcd-xhci-dbc.c b/hw/usb/hcd-xhci-dbc.c
+index 4b0808b3f..50db6f3b9 100644
+--- a/hw/usb/hcd-xhci-dbc.c
++++ b/hw/usb/hcd-xhci-dbc.c
+@@ -19,8 +19,9 @@
+ #include "qemu/osdep.h"
+ #include "qemu/error-report.h"
+ #include "qemu/log.h"
++#include "qemu/main-loop.h"
++#include "qemu/timer.h"
+ #include "qapi/error.h"
+-#include "migration/blocker.h"
+ #include "migration/vmstate.h"
+ #include "hw/core/qdev-properties.h"
+ #include "hw/usb/usb.h"
+@@ -70,6 +71,9 @@
+ 
+ #define DBC_MAX_PACKET  1024
+ 
++/* How long the cable stays unplugged after a migration, in ms */
++#define DBC_REPLUG_MS   100
++
+ #define TRB_SIZE        16
+ #define TRB_C           (1u << 0)
+ #define TRB_LK_TC       (1u << 1)
+@@ -98,6 +102,10 @@ struct USBDbCPeer {
+      */
+     USBPacket *pending[2];
+ 
++    /* the unplug and replug that follow a migration */
++    QEMUBH *post_load_bh;
++    QEMUTimer *replug_timer;
++
+     USBDesc desc;
+     USBDescDevice desc_dev;
+     USBDescConfig desc_conf;
+@@ -113,7 +121,6 @@ static const char *const dbc_peer_strings[] = {
+ };
+ 
+ static GSList *dbc_controllers;
+-static Error *dbc_migration_blocker;
+ 
+ /* Event ring */
+ 
+@@ -673,13 +680,6 @@ void xhci_dbc_realize(XHCIState *xhci, Error **errp)
+     /* over the reserved part of the operational registers */
+     memory_region_add_subregion_overlap(&xhci->mem, XHCI_DBC_OFFSET,
+                                         &xhci->dbc.mem, 1);
+-    if (!dbc_migration_blocker) {
+-        error_setg(&dbc_migration_blocker,
+-                   "xHCI Debug Capability state is not migratable");
+-        if (migrate_add_blocker(&dbc_migration_blocker, errp) < 0) {
+-            return;
+-        }
+-    }
+     dbc_controllers = g_slist_prepend(dbc_controllers, xhci);
+ }
+ 
+@@ -707,6 +707,71 @@ void xhci_dbc_reset(XHCIState *xhci)
+     d->ddi2 = 0;
+ }
+ 
++/* Migration */
++
++static const VMStateDescription vmstate_xhci_dbc_ring = {
++    .name = "xhci-dbc-ring",
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .fields = (const VMStateField[]) {
++        VMSTATE_UINT64(dequeue, XHCIRing),
++        VMSTATE_BOOL(ccs, XHCIRing),
++        VMSTATE_END_OF_LIST()
++    }
++};
++
++static const VMStateDescription vmstate_xhci_dbc_trb = {
++    .name = "xhci-dbc-trb",
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .fields = (const VMStateField[]) {
++        VMSTATE_BOOL(valid, XHCIDbCTRB),
++        VMSTATE_UINT64(addr, XHCIDbCTRB),
++        VMSTATE_UINT64(buf, XHCIDbCTRB),
++        VMSTATE_UINT32(len, XHCIDbCTRB),
++        VMSTATE_UINT32(done, XHCIDbCTRB),
++        VMSTATE_UINT32(control, XHCIDbCTRB),
++        VMSTATE_END_OF_LIST()
++    }
++};
++
++static bool xhci_dbc_needed(void *opaque)
++{
++    XHCIState *xhci = opaque;
++
++    return xhci->dbc_enabled;
++}
++
++/*
++ * The DbC's own state, a subsection of the controller's. The cable is
++ * the usb-dbc-peer device's to migrate.
++ */
++const VMStateDescription vmstate_xhci_dbc = {
++    .name = "xhci-core/dbc",
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .needed = xhci_dbc_needed,
++    .fields = (const VMStateField[]) {
++        VMSTATE_UINT32(dbc.erstsz, XHCIState),
++        VMSTATE_UINT64(dbc.erstba, XHCIState),
++        VMSTATE_UINT64(dbc.erdp, XHCIState),
++        VMSTATE_UINT32(dbc.ctrl, XHCIState),
++        VMSTATE_UINT32(dbc.portsc, XHCIState),
++        VMSTATE_UINT64(dbc.dccp, XHCIState),
++        VMSTATE_UINT32(dbc.ddi1, XHCIState),
++        VMSTATE_UINT32(dbc.ddi2, XHCIState),
++        VMSTATE_UINT64(dbc.er_start, XHCIState),
++        VMSTATE_UINT32(dbc.er_size, XHCIState),
++        VMSTATE_UINT32(dbc.er_idx, XHCIState),
++        VMSTATE_BOOL(dbc.er_pcs, XHCIState),
++        VMSTATE_STRUCT_ARRAY(dbc.ring, XHCIState, 2, 1,
++                             vmstate_xhci_dbc_ring, XHCIRing),
++        VMSTATE_STRUCT_ARRAY(dbc.trb, XHCIState, 2, 1,
++                             vmstate_xhci_dbc_trb, XHCIDbCTRB),
++        VMSTATE_END_OF_LIST()
++    }
++};
++
+ /* The cable's device end */
+ 
+ static XHCIState *dbc_find(const char *id)
+@@ -801,6 +866,43 @@ static void dbc_peer_cancel_packet(USBDevice *dev, USBPacket *p)
+     }
+ }
+ 
++static void dbc_peer_replug(void *opaque)
++{
++    USBDbCPeer *s = opaque;
++
++    if (s->xhci && (s->xhci->dbc.ctrl & DCCTRL_DCE)) {
++        dbc_connect(s->xhci);
++    }
++}
++
++/*
++ * The debug host's controller does not migrate the transfers it had in
++ * flight to the cable, and has moved its rings past them. Unplug the cable
++ * instead, as usb-host does with its device, and plug it back in once both
++ * guests have run. The target's DbC state is migrated, so DbC stays
++ * enabled there and sees a disconnect and a connect.
++ *
++ * Detaching changes the state of the other controller, so it waits for a
++ * bottom half, after all state is loaded.
++ */
++static void dbc_peer_post_load_bh(void *opaque)
++{
++    USBDbCPeer *s = opaque;
++
++    if (!s->xhci) {
++        if (s->dev.attached) {
++            usb_device_detach(&s->dev);
++        }
++        return;
++    }
++    trace_usb_xhci_dbc_state("replugging after migration");
++    dbc_disconnect(s->xhci);
++    if (s->xhci->dbc.ctrl & DCCTRL_DCE) {
++        timer_mod(s->replug_timer,
++                  qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + DBC_REPLUG_MS);
++    }
++}
++
+ static void dbc_peer_realize(USBDevice *dev, Error **errp)
+ {
+     USBDbCPeer *s = USB_DBC_PEER(dev);
+@@ -853,6 +955,9 @@ static void dbc_peer_realize(USBDevice *dev, Error **errp)
+ 
+     /* Attached only while the guest has DbC enabled. */
+     dev->auto_attach = 0;
++    s->post_load_bh = qemu_bh_new_guarded(dbc_peer_post_load_bh, s,
++                                          &DEVICE(dev)->mem_reentrancy_guard);
++    s->replug_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, dbc_peer_replug, s);
+     s->xhci = xhci;
+     xhci->dbc.peer = s;
+     if (xhci->dbc.ctrl & DCCTRL_DCE) {
+@@ -865,6 +970,8 @@ static void dbc_peer_unrealize(USBDevice *dev)
+     USBDbCPeer *s = USB_DBC_PEER(dev);
+     XHCIState *xhci = s->xhci;
+ 
++    g_clear_pointer(&s->post_load_bh, qemu_bh_delete);
++    g_clear_pointer(&s->replug_timer, timer_free);
+     if (!xhci) {
+         return;
+     }
+@@ -874,9 +981,30 @@ static void dbc_peer_unrealize(USBDevice *dev)
+     s->xhci = NULL;
+ }
+ 
++static int dbc_peer_post_load(void *opaque, int version_id)
++{
++    USBDbCPeer *s = opaque;
++
++    /*
++     * The speed is not migrated, and the debug host's controller needs it
++     * to find the SuperSpeed port to detach: pick it as attaching does.
++     */
++    if (s->dev.attached) {
++        usb_pick_speed(s->dev.port);
++    }
++    qemu_bh_schedule(s->post_load_bh);
++    return 0;
++}
++
+ static const VMStateDescription vmstate_dbc_peer = {
+     .name = TYPE_USB_DBC_PEER,
+-    .unmigratable = 1,
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .post_load = dbc_peer_post_load,
++    .fields = (const VMStateField[]) {
++        VMSTATE_USB_DEVICE(dev, USBDbCPeer),
++        VMSTATE_END_OF_LIST()
++    }
+ };
+ 
+ static const Property dbc_peer_properties[] = {
+diff --git a/hw/usb/hcd-xhci.c b/hw/usb/hcd-xhci.c
+index 485fd963c..f8c1fe5b4 100644
+--- a/hw/usb/hcd-xhci.c
++++ b/hw/usb/hcd-xhci.c
+@@ -3660,6 +3660,10 @@ const VMStateDescription vmstate_xhci = {
+         VMSTATE_STRUCT(cmd_ring, XHCIState, 1, vmstate_xhci_ring, XHCIRing),
+ 
+         VMSTATE_END_OF_LIST()
++    },
++    .subsections = (const VMStateDescription * const []) {
++        &vmstate_xhci_dbc,
++        NULL
+     }
+ };
+ 
+diff --git a/hw/usb/hcd-xhci.h b/hw/usb/hcd-xhci.h
+index b257e8a36..e6f6407ad 100644
+--- a/hw/usb/hcd-xhci.h
++++ b/hw/usb/hcd-xhci.h
+@@ -280,6 +280,7 @@ typedef struct XHCIState {
+ } XHCIState;
+ 
+ extern const VMStateDescription vmstate_xhci;
++extern const VMStateDescription vmstate_xhci_dbc;
+ bool xhci_get_flag(XHCIState *xhci, enum xhci_flags bit);
+ void xhci_set_flag(XHCIState *xhci, enum xhci_flags bit);
+ 
+-- 
+2.56.0
+

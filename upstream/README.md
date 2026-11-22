@@ -46,10 +46,17 @@ Differences between the two bases:
 Not needed: a `usb_debug` change. With `dbc_net` on its own product ID,
 `usb_debug`'s match on 0010 and 0011 never sees it.
 
-Not here: QEMU's DbC emulation, on branch `dbc` of `~/srcs/qemu-dbc`. QEMU
-can't take it as written: `docs/devel/code-provenance.rst` says the project
-declines contributions that include or derive from AI-generated content,
-naming Claude. It stays a local test fixture.
+QEMU's DbC emulation is in [`qemu/`](qemu), a five-patch RFC series from
+branch `dbc-series` of `~/srcs/qemu-dbc`: the emulation, migration, a qtest
+harness split, qtests, and docs. `nix/qemu-dbc.nix` applies the whole
+series, so the VM tests run what it contains. It is **not submittable**:
+`docs/devel/code-provenance.rst` says QEMU declines contributions that
+include or derive from AI-generated content, naming Claude, and the cover
+letter says so first. It is ready should that policy change, or as a
+reference for a human's own implementation. It is based on the 11.1.2
+release tarball and would need a rebase onto qemu.git master. To run its
+qtests, build QEMU from that branch and run
+`tests/qtest/usb-hcd-xhci-test -p /x86_64/xhci/pci/dbc`.
 
 The kernel's rules for AI-assisted patches are in 7.4-rc3's
 `Documentation/process/coding-assistants.rst` and `generated-content.rst`.

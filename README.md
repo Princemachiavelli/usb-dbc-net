@@ -82,7 +82,7 @@ up gets the shared checks (`nix/vm-common.py`):
 - iperf3 in both directions, reported but not asserted.
 
 `vm-dbc` runs the guest's DbC on emulated hardware, using QEMU with
-[`qemu/xhci-dbc.patch`](qemu/xhci-dbc.patch). Its target module carries
+the QEMU series in [`upstream/qemu/`](upstream/qemu). Its target module carries
 both functions. It checks, in order:
 1. **`dbc_net` + `dbcnet.ko`**, through the two NixOS modules on a stock
    kernel:

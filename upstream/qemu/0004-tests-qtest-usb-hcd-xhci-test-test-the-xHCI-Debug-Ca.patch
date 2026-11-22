@@ -1,0 +1,560 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Josh Hoffer <jhoffer@sansorgan.es>
+Date: Sat, 21 Nov 2026 16:18:30 -0800
+Subject: [RFC PATCH 4/5] tests/qtest/usb-hcd-xhci-test: test the xHCI Debug
+ Capability
+
+A second qemu-xhci, with dbc=on, is the debug target, and usb-dbc-peer
+plugs it into the first, which the test drives as the debug host.
+
+- transfer: enable DbC, enumerate and configure the cable from the
+  debug host, and move data both ways, each with a short packet.
+- disable: disabling DbC unplugs the cable from the debug host, and
+  enabling it again plugs it back in.
+- migrate: migrate with the link configured and a transfer each way
+  partly done. DbC stays enabled with its registers intact, the cable is
+  unplugged and plugged back in, the partial transfers never complete,
+  and the debug host enumerates the cable again and moves fresh data.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ tests/qtest/usb-hcd-xhci-test.c | 516 ++++++++++++++++++++++++++++++++
+ 1 file changed, 516 insertions(+)
+
+diff --git a/tests/qtest/usb-hcd-xhci-test.c b/tests/qtest/usb-hcd-xhci-test.c
+index 14010384d..9976b94a2 100644
+--- a/tests/qtest/usb-hcd-xhci-test.c
++++ b/tests/qtest/usb-hcd-xhci-test.c
+@@ -449,6 +449,519 @@ static void test_xhci_isoch_ep_type_mismatch(void)
+     xhci_test_end(&x);
+ }
+ 
++/*
++ * xHCI Debug Capability. A second qemu-xhci, with dbc=on, is the debug
++ * target; usb-dbc-peer, the cable, plugs into the first, which the test
++ * drives as the debug host.
++ */
++
++#define XHCI_HCCPARAMS1         0x10
++#define XHCI_EXT_CAPS_DEBUG     10
++
++/* DbC registers, relative to the capability */
++#define DCDB                    0x04
++#define DCERSTSZ                0x08
++#define DCERSTBA                0x10
++#define DCERDP                  0x18
++#define DCCTRL                  0x20
++#define DCPORTSC                0x28
++#define DCCP                    0x30
++#define DCDDI1                  0x38
++#define DCDDI2                  0x3c
++
++#define DCCTRL_DCR              (1u << 0)
++#define DCCTRL_DCE              (1u << 31)
++#define DCPORTSC_CCS            (1u << 0)
++
++#define TR_NORMAL               1
++#define TR_SETUP                2
++#define TR_DATA                 3
++#define TR_STATUS               4
++#define ER_PORT_STATUS_CHANGE   34
++#define CC_SHORT_PACKET         13
++#define TRB_TR_ISP              (1 << 2)
++#define TRB_TR_IDT              (1 << 6)
++#define TRB_TR_DIR              (1 << 16)
++#define EP_TYPE_BULK_OUT        2
++#define EP_TYPE_BULK_IN         6
++
++#define USB_DIR_IN              0x80
++#define USB_REQ_GET_DESCRIPTOR  0x06
++#define USB_REQ_SET_CONFIGURATION 0x09
++#define USB_DT_DEVICE           0x01
++
++#define DBC_TEST_VID            0x1d6b
++#define DBC_TEST_PID            0x0012
++#define DBC_TEST_DEVICES \
++    "-device qemu-xhci,id=dbct,addr=05.0,dbc=on " \
++    "-device usb-dbc-peer,id=cable,dbc=dbct,bus=xhci.0"
++
++typedef struct DbCTarget {
++    struct qhc hc;
++    uint32_t regs;
++    uint64_t ctx, event_ring, ring[2];
++    unsigned int event_idx, ring_idx[2];
++} DbCTarget;
++
++static uint32_t dbc_readl(DbCTarget *t, uint32_t reg)
++{
++    return qpci_io_readl(t->hc.dev, t->hc.bar, t->regs + reg);
++}
++
++static void dbc_writel(DbCTarget *t, uint32_t reg, uint32_t val)
++{
++    qpci_io_writel(t->hc.dev, t->hc.bar, t->regs + reg, val);
++}
++
++static void dbc_writeq(DbCTarget *t, uint32_t reg, uint64_t val)
++{
++    dbc_writel(t, reg, val);
++    dbc_writel(t, reg + 4, val >> 32);
++}
++
++static void dbc_target_init(XHCITest *x, DbCTarget *t)
++{
++    uint32_t off;
++
++    qusb_pci_init_one(x->bus, &t->hc, QPCI_DEVFN(5, 0), 0);
++    off = (qpci_io_readl(t->hc.dev, t->hc.bar, XHCI_HCCPARAMS1) >> 16) << 2;
++    for (;;) {
++        uint32_t cap = qpci_io_readl(t->hc.dev, t->hc.bar, off);
++
++        if ((cap & 0xff) == XHCI_EXT_CAPS_DEBUG) {
++            t->regs = off;
++            return;
++        }
++        g_assert_cmpuint((cap >> 8) & 0xff, !=, 0);
++        off += ((cap >> 8) & 0xff) << 2;
++    }
++}
++
++static unsigned int dbc_write_string(XHCITest *x, uint64_t addr,
++                                     const char *s)
++{
++    unsigned int i, len = 2 + 2 * strlen(s);
++
++    qtest_writeb(x->qts, addr, len);
++    qtest_writeb(x->qts, addr + 1, 3);
++    for (i = 0; s[i]; i++) {
++        qtest_writew(x->qts, addr + 2 + 2 * i, s[i]);
++    }
++    return len;
++}
++
++/* Points the DbC's endpoint contexts at where the target will queue next. */
++static void dbc_target_set_dequeue(XHCITest *x, DbCTarget *t)
++{
++    int r;
++
++    for (r = 0; r < 2; r++) {
++        qtest_writeq(x->qts, t->ctx + 0x40 * (1 + r) + 0x08,
++                     (t->ring[r] + 16 * t->ring_idx[r]) | 1);
++    }
++}
++
++/* Program and enable the target's DbC, as a driver would. */
++static void dbc_target_start(XHCITest *x, DbCTarget *t)
++{
++    static const char *const strings[] = { "QEMU", "DbC test", "0001" };
++    uint64_t erst = xhci_alloc_page(x);
++    uint64_t str = xhci_alloc_page(x);
++    uint32_t lens = 4;
++    int i;
++
++    t->event_ring = xhci_alloc_page(x);
++    t->ctx = xhci_alloc_page(x);
++    t->ring[0] = xhci_alloc_page(x);
++    t->ring[1] = xhci_alloc_page(x);
++
++    qtest_writeq(x->qts, erst, t->event_ring);
++    qtest_writel(x->qts, erst + 8, XHCI_RING_TRBS);
++    dbc_writel(t, DCERSTSZ, 1);
++    dbc_writeq(t, DCERSTBA, erst);
++    dbc_writeq(t, DCERDP, t->event_ring);
++
++    /* info context: string 0 (US English) and three strings, lengths */
++    qtest_writeb(x->qts, str, 4);
++    qtest_writeb(x->qts, str + 1, 3);
++    qtest_writew(x->qts, str + 2, 0x0409);
++    qtest_writeq(x->qts, t->ctx, str);
++    for (i = 0; i < 3; i++) {
++        uint64_t addr = str + 64 * (i + 1);
++
++        qtest_writeq(x->qts, t->ctx + 8 * (i + 1), addr);
++        lens |= dbc_write_string(x, addr, strings[i]) << (8 * (i + 1));
++    }
++    qtest_writel(x->qts, t->ctx + 0x20, lens);
++    dbc_target_set_dequeue(x, t);
++    dbc_writeq(t, DCCP, t->ctx);
++
++    dbc_writel(t, DCDDI1, DBC_TEST_VID << 16);
++    dbc_writel(t, DCDDI2, (0x0100 << 16) | DBC_TEST_PID);
++    dbc_writel(t, DCCTRL, DCCTRL_DCE);
++}
++
++static bool dbc_next_event(XHCITest *x, DbCTarget *t, uint64_t *param,
++                           uint32_t *status, uint32_t *control)
++{
++    uint64_t addr = t->event_ring + 16 * t->event_idx;
++    uint32_t c = qtest_readl(x->qts, addr + 12);
++
++    if (!(c & TRB_C)) {
++        return false;
++    }
++    if (param) {
++        *param = qtest_readq(x->qts, addr);
++    }
++    if (status) {
++        *status = qtest_readl(x->qts, addr + 8);
++    }
++    if (control) {
++        *control = c;
++    }
++    t->event_idx++;
++    g_assert_cmpuint(t->event_idx, <, XHCI_RING_TRBS);
++    dbc_writeq(t, DCERDP, addr + 16);
++    return true;
++}
++
++static void dbc_expect_port_event(XHCITest *x, DbCTarget *t)
++{
++    uint32_t control;
++
++    g_assert_true(dbc_next_event(x, t, NULL, NULL, &control));
++    g_assert_cmpuint(TRB_GET_TYPE(control), ==, ER_PORT_STATUS_CHANGE);
++}
++
++/* Queue a Normal TRB on the target's ring r and ring the doorbell. */
++static uint64_t dbc_queue(XHCITest *x, DbCTarget *t, int r, uint64_t buf,
++                          uint32_t len)
++{
++    uint64_t trb = t->ring[r] + 16 * t->ring_idx[r]++;
++
++    xhci_write_trb(x, trb, buf, len,
++                   TRB_TYPE(TR_NORMAL) | TRB_TR_ISP | TRB_TR_IOC | TRB_C);
++    dbc_writel(t, DCDB, r << 8);
++    return trb;
++}
++
++static void xhci_ep0_trb(XHCITest *x, uint64_t parameter, uint32_t status,
++                         uint32_t control)
++{
++    xhci_write_trb(x, x->ep0_ring + 16 * x->ep0_idx++, parameter, status,
++                   control | TRB_C);
++}
++
++/* A control transfer on the debug host's ep0; returns the completion code. */
++static unsigned int xhci_control(XHCITest *x, uint8_t type, uint8_t req,
++                                 uint16_t value, uint16_t length, uint64_t buf)
++{
++    uint64_t setup = type | (req << 8) | ((uint64_t)value << 16) |
++                     ((uint64_t)length << 48);
++    bool in = type & USB_DIR_IN;
++    uint32_t status, control;
++
++    xhci_ep0_trb(x, setup, 8, TRB_TYPE(TR_SETUP) | TRB_TR_IDT |
++                 (length ? (in ? 3 : 2) << 16 : 0));
++    if (length) {
++        xhci_ep0_trb(x, buf, length,
++                     TRB_TYPE(TR_DATA) | (in ? TRB_TR_DIR : 0));
++    }
++    xhci_ep0_trb(x, 0, 0, TRB_TYPE(TR_STATUS) | TRB_TR_IOC |
++                 (length && in ? 0 : TRB_TR_DIR));
++    xhci_writel(x, x->doorbell + 4 * x->slot, 1);
++
++    g_assert_true(xhci_next_event(x, &status, &control));
++    g_assert_cmpuint(TRB_GET_TYPE(control), ==, ER_TRANSFER);
++    return TRB_GET_CCODE(status);
++}
++
++typedef struct DbCHostEps {
++    uint64_t ring[2];       /* bulk OUT (epid 2), bulk IN (epid 3) */
++    unsigned int idx[2];
++} DbCHostEps;
++
++/*
++ * As the debug host, with the cable addressed: check its identity,
++ * configure it and its two bulk endpoints.
++ */
++static void dbc_host_configure(XHCITest *x, DbCTarget *t, DbCHostEps *eps)
++{
++    uint64_t buf = xhci_alloc_page(x);
++
++    g_assert_cmpuint(xhci_control(x, USB_DIR_IN, USB_REQ_GET_DESCRIPTOR,
++                                  USB_DT_DEVICE << 8, 18, buf),
++                     ==, CC_SUCCESS);
++    g_assert_cmphex(qtest_readw(x->qts, buf + 8), ==, DBC_TEST_VID);
++    g_assert_cmphex(qtest_readw(x->qts, buf + 10), ==, DBC_TEST_PID);
++
++    g_assert_false(dbc_readl(t, DCCTRL) & DCCTRL_DCR);
++    g_assert_cmpuint(xhci_control(x, 0, USB_REQ_SET_CONFIGURATION, 1, 0, 0),
++                     ==, CC_SUCCESS);
++    g_assert_true(dbc_readl(t, DCCTRL) & DCCTRL_DCR);
++
++    eps->ring[0] = xhci_configure_ep(x, 2, EP_TYPE_BULK_OUT, 0, 1024);
++    eps->ring[1] = xhci_configure_ep(x, 3, EP_TYPE_BULK_IN, 0, 1024);
++    eps->idx[0] = eps->idx[1] = 0;
++}
++
++/* Queue a Normal TRB on one of the debug host's bulk endpoints. */
++static void dbc_host_queue(XHCITest *x, DbCHostEps *eps, int in, uint64_t buf,
++                           uint32_t len)
++{
++    xhci_write_trb(x, eps->ring[in] + 16 * eps->idx[in]++, buf, len,
++                   TRB_TYPE(TR_NORMAL) | TRB_TR_ISP | TRB_TR_IOC | TRB_C);
++    xhci_writel(x, x->doorbell + 4 * x->slot, 2 + in);
++}
++
++static void dbc_fill(XHCITest *x, uint64_t addr, uint32_t len, uint8_t seed)
++{
++    g_autofree uint8_t *data = g_malloc(len);
++    uint32_t i;
++
++    for (i = 0; i < len; i++) {
++        data[i] = seed + i * 7;
++    }
++    qtest_memwrite(x->qts, addr, data, len);
++}
++
++static void dbc_check(XHCITest *x, uint64_t addr, uint32_t len, uint8_t seed)
++{
++    g_autofree uint8_t *data = g_malloc(len);
++    uint32_t i;
++
++    qtest_memread(x->qts, addr, data, len);
++    for (i = 0; i < len; i++) {
++        g_assert_cmpuint(data[i], ==, (uint8_t)(seed + i * 7));
++    }
++}
++
++/*
++ * One transfer each way, each shorter than the buffer at the other end:
++ * the receiving side completes with Short Packet and the residue.
++ */
++static void dbc_transfer_both_ways(XHCITest *x, DbCTarget *t, DbCHostEps *eps,
++                                   uint8_t seed)
++{
++    const uint32_t len = 1500;
++    uint64_t tbuf = xhci_alloc_page(x), hbuf = xhci_alloc_page(x);
++    uint64_t param, trb;
++    uint32_t status, control;
++
++    /* target to debug host */
++    dbc_fill(x, tbuf, len, seed);
++    trb = dbc_queue(x, t, 0, tbuf, len);
++    g_assert_false(dbc_next_event(x, t, NULL, NULL, NULL));
++    dbc_host_queue(x, eps, 1, hbuf, 4096);
++
++    g_assert_true(xhci_next_event(x, &status, &control));
++    g_assert_cmpuint(TRB_GET_TYPE(control), ==, ER_TRANSFER);
++    g_assert_cmpuint(TRB_GET_CCODE(status), ==, CC_SHORT_PACKET);
++    g_assert_cmpuint(status & 0xffffff, ==, 4096 - len);
++    dbc_check(x, hbuf, len, seed);
++
++    g_assert_true(dbc_next_event(x, t, &param, &status, &control));
++    g_assert_cmpuint(TRB_GET_TYPE(control), ==, ER_TRANSFER);
++    g_assert_cmphex(param, ==, trb);
++    g_assert_cmpuint(TRB_GET_CCODE(status), ==, CC_SUCCESS);
++
++    /* debug host to target */
++    qtest_memset(x->qts, tbuf, 0, 0x1000);
++    trb = dbc_queue(x, t, 1, tbuf, 4096);
++    dbc_fill(x, hbuf, len, seed + 1);
++    dbc_host_queue(x, eps, 0, hbuf, len);
++
++    g_assert_true(xhci_next_event(x, &status, &control));
++    g_assert_cmpuint(TRB_GET_TYPE(control), ==, ER_TRANSFER);
++    g_assert_cmpuint(TRB_GET_CCODE(status), ==, CC_SUCCESS);
++
++    g_assert_true(dbc_next_event(x, t, &param, &status, &control));
++    g_assert_cmpuint(TRB_GET_TYPE(control), ==, ER_TRANSFER);
++    g_assert_cmphex(param, ==, trb);
++    g_assert_cmpuint(TRB_GET_CCODE(status), ==, CC_SHORT_PACKET);
++    g_assert_cmpuint(status & 0xffffff, ==, 4096 - len);
++    dbc_check(x, tbuf, len, seed + 1);
++}
++
++/*
++ * Enable DbC on the target, then run the debug host, which finds the
++ * cable connected.
++ */
++static void dbc_test_start(XHCITest *x, DbCTarget *t, DbCHostEps *eps)
++{
++    memset(t, 0, sizeof(*t));
++    xhci_test_init(x, DBC_TEST_DEVICES);
++    dbc_target_init(x, t);
++    g_assert_false(dbc_readl(t, DCPORTSC) & DCPORTSC_CCS);
++
++    dbc_target_start(x, t);
++    g_assert_true(dbc_readl(t, DCPORTSC) & DCPORTSC_CCS);
++    dbc_expect_port_event(x, t);
++
++    xhci_test_run(x);
++    /* the debug host's resets */
++    dbc_expect_port_event(x, t);
++    while (dbc_next_event(x, t, NULL, NULL, NULL)) {
++        /* more of them */
++    }
++    dbc_host_configure(x, t, eps);
++}
++
++static void dbc_test_end(XHCITest *x, DbCTarget *t)
++{
++    g_free(t->hc.dev);
++    xhci_test_end(x);
++}
++
++static void test_xhci_dbc_transfer(void)
++{
++    DbCHostEps eps;
++    DbCTarget t;
++    XHCITest x;
++
++    if (!xhci_test_supported("usb-dbc-peer")) {
++        return;
++    }
++    dbc_test_start(&x, &t, &eps);
++    dbc_transfer_both_ways(&x, &t, &eps, 0x10);
++    dbc_transfer_both_ways(&x, &t, &eps, 0x20);
++    dbc_test_end(&x, &t);
++}
++
++/* Disabling DbC unplugs the cable; enabling it again plugs it back in. */
++static void test_xhci_dbc_disable(void)
++{
++    uint32_t portsc;
++    DbCHostEps eps;
++    DbCTarget t;
++    XHCITest x;
++
++    if (!xhci_test_supported("usb-dbc-peer")) {
++        return;
++    }
++    dbc_test_start(&x, &t, &eps);
++
++    dbc_writel(&t, DCCTRL, 0);
++    g_assert_cmphex(dbc_readl(&t, DCPORTSC), ==, 0);
++    portsc = xhci_readl(&x, x.oper + XHCI_PORTSC(x.port));
++    g_assert_false(portsc & PORTSC_CCS);
++
++    /* the driver starts over, at the rings' current positions */
++    t.event_idx = 0;
++    qtest_memset(x.qts, t.event_ring, 0, 0x1000);
++    dbc_writeq(&t, DCERDP, t.event_ring);
++    dbc_target_set_dequeue(&x, &t);
++    dbc_writel(&t, DCCTRL, DCCTRL_DCE);
++    dbc_expect_port_event(&x, &t);
++    portsc = xhci_readl(&x, x.oper + XHCI_PORTSC(x.port));
++    g_assert_true(portsc & PORTSC_CCS);
++    g_assert_false(dbc_next_event(&x, &t, NULL, NULL, NULL));
++
++    dbc_test_end(&x, &t);
++}
++
++/*
++ * Migrate with the link configured. DbC stays enabled on the target, the
++ * cable is unplugged and plugged back in, and the debug host enumerates it
++ * again and moves data.
++ */
++static void test_xhci_dbc_migrate(void)
++{
++    g_autofree char *tmpdir = g_dir_make_tmp("xhci-dbc-XXXXXX", NULL);
++    g_autofree char *uri = g_strdup_printf("unix:%s/migsocket", tmpdir);
++    g_autofree char *socket = g_strdup_printf("%s/migsocket", tmpdir);
++    g_autofree char *cmdline = NULL;
++    QTestState *src, *dst;
++    uint64_t erdp, stale, hbuf;
++    uint32_t status, control;
++    DbCHostEps eps;
++    DbCTarget t;
++    XHCITest x;
++
++    if (!xhci_test_supported("usb-dbc-peer")) {
++        return;
++    }
++    dbc_test_start(&x, &t, &eps);
++    dbc_transfer_both_ways(&x, &t, &eps, 0x30);
++
++    /*
++     * A transfer each way in flight: the debug host moves one full packet
++     * of each, and neither ends.
++     */
++    stale = xhci_alloc_page(&x);
++    xhci_alloc_page(&x);
++    dbc_fill(&x, stale, 3000, 0x31);
++    dbc_queue(&x, &t, 0, stale, 3000);
++    hbuf = xhci_alloc_page(&x);
++    dbc_host_queue(&x, &eps, 1, hbuf, 1024);
++    g_assert_true(xhci_next_event(&x, &status, &control));
++    g_assert_cmpuint(TRB_GET_CCODE(status), ==, CC_SUCCESS);
++
++    qtest_memset(x.qts, stale + 0x1000, 0, 0x1000);
++    dbc_queue(&x, &t, 1, stale + 0x1000, 4096);
++    dbc_fill(&x, hbuf, 1024, 0x32);
++    dbc_host_queue(&x, &eps, 0, hbuf, 1024);
++    g_assert_true(xhci_next_event(&x, &status, &control));
++    g_assert_cmpuint(TRB_GET_CCODE(status), ==, CC_SUCCESS);
++    dbc_check(&x, stale + 0x1000, 1024, 0x32);
++
++    g_assert_false(dbc_next_event(&x, &t, NULL, NULL, NULL));
++    erdp = t.event_ring + 16 * t.event_idx;
++
++    cmdline = xhci_test_cmdline(DBC_TEST_DEVICES " -incoming defer");
++    src = x.qts;
++    dst = qtest_init(cmdline);
++    qtest_qmp_assert_success(dst, "{ 'execute': 'migrate-incoming',"
++                             "  'arguments': { 'uri': %s } }", uri);
++    qtest_qmp_assert_success(src, "{ 'execute': 'migrate',"
++                             "  'arguments': { 'uri': %s } }", uri);
++    qtest_qmp_eventwait(dst, "RESUME");
++    qtest_quit(src);
++    unlink(socket);
++    g_rmdir(tmpdir);
++
++    /* the same devices, at the same addresses, on the destination */
++    x.qts = dst;
++    qpci_free_pc(x.bus);
++    g_free(x.hc.dev);
++    g_free(t.hc.dev);
++    x.bus = qpci_new_pc(dst, NULL);
++    qusb_pci_init_one(x.bus, &x.hc, QPCI_DEVFN(4, 0), 0);
++    dbc_target_init(&x, &t);
++
++    /* DbC state came across */
++    g_assert_true(dbc_readl(&t, DCCTRL) & DCCTRL_DCE);
++    g_assert_cmphex(dbc_readl(&t, DCERDP), ==, (uint32_t)erdp);
++    g_assert_cmphex(dbc_readl(&t, DCDDI2), ==, (0x0100 << 16) | DBC_TEST_PID);
++
++    /* unplugged, the target's events following on from before */
++    g_assert_false(dbc_readl(&t, DCPORTSC) & DCPORTSC_CCS);
++    g_assert_false(dbc_readl(&t, DCCTRL) & DCCTRL_DCR);
++    dbc_expect_port_event(&x, &t);
++    g_assert_false(xhci_readl(&x, x.oper + XHCI_PORTSC(x.port)) & PORTSC_CCS);
++
++    /* and plugged back in */
++    qtest_clock_step(dst, 200 * 1000 * 1000);
++    g_assert_true(dbc_readl(&t, DCPORTSC) & DCPORTSC_CCS);
++    dbc_expect_port_event(&x, &t);
++    g_assert_true(xhci_readl(&x, x.oper + XHCI_PORTSC(x.port)) & PORTSC_CCS);
++
++    /*
++     * The transfers in flight were given up with the unplug: they never
++     * complete, and the driver queues afresh after them.
++     */
++    dbc_target_set_dequeue(&x, &t);
++    xhci_address_device(&x);
++    while (dbc_next_event(&x, &t, NULL, NULL, &control)) {
++        /* the debug host's port reset */
++        g_assert_cmpuint(TRB_GET_TYPE(control), ==, ER_PORT_STATUS_CHANGE);
++    }
++    dbc_host_configure(&x, &t, &eps);
++    dbc_transfer_both_ways(&x, &t, &eps, 0x40);
++    g_assert_cmpuint(qtest_readb(x.qts, stale + 0x1000 + 1024), ==, 0);
++    dbc_test_end(&x, &t);
++}
++
+ int main(int argc, char **argv)
+ {
+     int ret;
+@@ -467,6 +980,9 @@ int main(int argc, char **argv)
+                    test_xhci_isoch_mfindex_32bit);
+     qtest_add_func("/xhci/pci/isoch/ep-type-mismatch",
+                    test_xhci_isoch_ep_type_mismatch);
++    qtest_add_func("/xhci/pci/dbc/transfer", test_xhci_dbc_transfer);
++    qtest_add_func("/xhci/pci/dbc/disable", test_xhci_dbc_disable);
++    qtest_add_func("/xhci/pci/dbc/migrate", test_xhci_dbc_migrate);
+ 
+     qtest_start("-device nec-usb-xhci,id=xhci"
+                 " -drive id=drive0,if=none,file=null-co://,"
+-- 
+2.56.0
+

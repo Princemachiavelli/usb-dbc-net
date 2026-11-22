@@ -1,3 +1,31 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Josh Hoffer <jhoffer@sansorgan.es>
+Date: Sat, 21 Nov 2026 04:46:57 -0800
+Subject: [RFC PATCH 1/5] hw/usb: xHCI Debug Capability emulation and the
+ usb-dbc-peer cable end
+
+The Debug Capability (xHCI 1.2 section 7.6) lets a host controller present
+a root port as a USB device to another host. With dbc=on, qemu-xhci
+exposes the DbC register block at 0x400 behind the Supported Protocol
+capabilities, with its event ring and two transfer rings. usb-dbc-peer,
+plugged into another USB bus, is the debug host's end of the cable: it
+attaches while the guest has DbC enabled and enumerates with the identity
+and strings the guest programmed.
+
+A TRB is taken only when the event ring has room for its completion, so a
+driver that writes ERDP late holds transfers off instead of losing events.
+Migration is blocked while any DbC-enabled controller exists.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ hw/usb/hcd-xhci-dbc.c | 917 ++++++++++++++++++++++++++++++++++++++++++
+ hw/usb/hcd-xhci.c     |  29 +-
+ hw/usb/hcd-xhci.h     |  58 +++
+ hw/usb/meson.build    |   2 +-
+ hw/usb/trace-events   |   9 +
+ 5 files changed, 1013 insertions(+), 2 deletions(-)
+ create mode 100644 hw/usb/hcd-xhci-dbc.c
+
 diff --git a/hw/usb/hcd-xhci-dbc.c b/hw/usb/hcd-xhci-dbc.c
 new file mode 100644
 index 000000000..4b0808b3f
@@ -1102,3 +1130,6 @@ index 0d4318dcf..df1c7f756 100644
  # hcd-xhci.c
  usb_xhci_reset(void) "=== RESET ==="
  usb_xhci_exit(void) "=== EXIT ==="
+-- 
+2.56.0
+

@@ -1,0 +1,79 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Josh Hoffer <jhoffer@sansorgan.es>
+Date: Sat, 21 Nov 2026 16:19:06 -0800
+Subject: [RFC PATCH 0/5] hw/usb: emulate the xHCI Debug Capability
+
+NOT SUBMITTABLE AS IS. docs/devel/code-provenance.rst says QEMU declines
+contributions that include or derive from AI-generated content, and this
+series was written by an AI coding assistant (see "Tool use" below). It
+is prepared so that it is ready should that policy change, or so that a
+human can use it as a reference for an independent implementation. It
+also carries no Signed-off-by: the assistant cannot certify the DCO.
+
+The xHCI Debug Capability (xHCI 1.2 section 7.6) lets a host controller
+present one of its ports as a USB device to another host, over a USB 3
+debug cable. Linux uses it for ttyDBC and early printk, and, in a
+proposed series, for a network interface (dbc_net). None of these can be
+tested in QEMU today, since no emulated controller has the capability.
+
+With dbc=on, qemu-xhci offers it. usb-dbc-peer is the debug host's end
+of the cable: a USB device on any USB bus, attached only while the guest
+has DbC enabled, enumerating with the identity and strings the guest
+programmed.
+
+  1/5 the emulation and usb-dbc-peer. Off by default, so existing
+      machines and their migration are untouched; a controller with
+      dbc=on blocks migration.
+  2/5 migration: the DbC state goes in a subsection sent when the
+      controller has dbc=on. The debug host's controller cannot migrate
+      the transfers it had in flight to the cable, so after loading, the
+      cable is unplugged and plugged back in, as usb-host does with its
+      device; a partly done transfer is given up, as on hardware.
+  3/5 splits the xHCI qtest's start-up so a test can set up a second
+      controller before the first runs; no change to existing tests.
+  4/5 qtests: transfers both ways, disable/enable, and migration.
+  5/5 documentation.
+
+Testing:
+- the xHCI qtests, the six existing ones and the three new ones, pass;
+  3/5 alone passes the six existing ones. The migrate test fails, as it
+  should, with the emulation changed to keep partial transfers across
+  the replug;
+- NixOS VM tests run Linux's own DbC drivers (ttyDBC and dbc_net) on
+  6.18.64 and 7.4-rc3 against the emulation, with a Linux debug host on
+  usb-dbc-peer: enumeration, traffic both ways at all frame sizes up to
+  9004 bytes, a guest paused mid-transfer, and DbC disabled and enabled
+  five times under traffic;
+- checkpatch.pl is clean but for a MAINTAINERS warning on the new file,
+  which "USB: F: hw/usb/*" already covers.
+Migration was tested by the qtest only, not with a running Linux guest.
+
+Base: the QEMU 11.1.2 release tarball, not qemu.git master. It would
+need a rebase before posting.
+
+Tool use: Claude Code (Claude Opus 5.5) wrote all five patches, the
+tests and the documentation. The prompts asked for DbC emulation in
+QEMU, to test Linux's DbC drivers without hardware, and then for this
+series to be prepared for upstream. A human set the goals and the scope;
+the code has had no human review yet.
+
+Josh Hoffer (5):
+  hw/usb: xHCI Debug Capability emulation and the usb-dbc-peer cable end
+  hw/usb/hcd-xhci-dbc: migrate the Debug Capability
+  tests/qtest/usb-hcd-xhci-test: split starting QEMU from running xHCI
+  tests/qtest/usb-hcd-xhci-test: test the xHCI Debug Capability
+  docs/system/devices/usb: document the xHCI Debug Capability
+
+ docs/system/devices/usb.rst     |   28 +
+ hw/usb/hcd-xhci-dbc.c           | 1045 +++++++++++++++++++++++++++++++
+ hw/usb/hcd-xhci.c               |   33 +-
+ hw/usb/hcd-xhci.h               |   59 ++
+ hw/usb/meson.build              |    2 +-
+ hw/usb/trace-events             |    9 +
+ tests/qtest/usb-hcd-xhci-test.c |  612 ++++++++++++++++--
+ 7 files changed, 1751 insertions(+), 37 deletions(-)
+ create mode 100644 hw/usb/hcd-xhci-dbc.c
+
+--
+2.56.0
+

@@ -6,7 +6,7 @@ written first; the status section records what was then built.
 
 ## Status
 
-Built as design A below, in [`qemu/xhci-dbc.patch`](../qemu/xhci-dbc.patch)
+Built as design A below, in the series in [`upstream/qemu/`](../upstream/qemu)
 against QEMU 11.1.2 (`nix/qemu-dbc.nix`). It adds about 1,000 lines, close
 to the estimate below:
 - a new `hw/usb/hcd-xhci-dbc.c` (~900 lines), holding the register block, event ring,
@@ -114,8 +114,12 @@ one property the scoping predicted.
    1024-byte boundary. `--no-pad` shows the reply arriving only at the
    host's read timeout.
 
+Migration, done later for the upstream series (patch 2): the DbC state
+migrates in a subsection, and the cable is unplugged and plugged back in
+after loading, because the debug host's controller can't migrate the
+transfers it had in flight. Only the qtest covers it, not a Linux guest.
+
 Not done in the emulation:
-- migration (a blocker is registered);
 - endpoint halt (DbC never stalls, and `CLEAR_FEATURE(ENDPOINT_HALT)` is
   acked).
 
@@ -215,7 +219,7 @@ first is enough for one VM:
   `LEN_CAP`, gated by a `dbc=on` property, default off, so existing
   machines and migration are untouched.
 - **Migration.** Start as unmigratable (a migration blocker). Add vmstate
-  only if upstreaming.
+  only if upstreaming. (Since added; see the status section.)
 
 ## Size and cost
 
