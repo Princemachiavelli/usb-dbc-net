@@ -23,7 +23,8 @@ How they're checked:
   DbC disabled and re-enabled under traffic. This is the stop fix exactly
   as it would be sent. The one thing not run there is `dbcnet.c`'s
   `kzalloc_obj()` variant; the tests load `kmod/dbcnet.c`, which differs
-  from it only in that allocation.
+  from it only in that allocation and in byte queue limits of its own,
+  compiled only before 6.19.
 - **Each step of the series builds on its own,** on both bases.
 - **checkpatch (7.4-rc3)** reports one error per patch, "Missing
   Signed-off-by", which is deliberate (see below); your sign-off clears
@@ -42,6 +43,9 @@ Differences between the two bases:
   `dbc_net` parameter.
 - **`kzalloc_obj()`:** `dbcnet.c` uses it on mainline, as checkpatch now
   asks. `kmod/dbcnet.c` and `v6.18/` keep `kzalloc()`.
+- **Byte queue limits:** usbnet keeps them from 6.19 on. `kmod/dbcnet.c`
+  and `v6.18/` keep their own before that; checkpatch flags the
+  `LINUX_VERSION_CODE` test in `v6.18/`, which is never sent.
 
 Not needed: a `usb_debug` change. With `dbc_net` on its own product ID,
 `usb_debug`'s match on 0010 and 0011 never sees it.

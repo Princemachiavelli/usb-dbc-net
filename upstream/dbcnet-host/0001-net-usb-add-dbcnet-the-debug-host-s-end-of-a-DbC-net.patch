@@ -1,4 +1,4 @@
-From 66f9d5dfba5a9d3a6cfd6a89638e367c9e4a1849 Mon Sep 17 00:00:00 2001
+From 10263250c89cd978b0a2a4bb30a5cd86d9aebec6 Mon Sep 17 00:00:00 2001
 From: Josh Hoffer <jhoffer@sansorgan.es>
 Date: Sat, 21 Nov 2026 13:14:53 -0800
 Subject: [RFC PATCH net-next] net: usb: add dbcnet, the debug host's end of a
@@ -14,9 +14,15 @@ controller on either side.
   length), packets forming a byte stream in each direction. The decoder
   keeps its state across URBs, since frames span them, and delivers
   each packet from rx_fixup.
-- Transmit batches packets into one URB while the stack has more
-  queued, up to 32 KiB. The target's receive TRBs are 64 KiB, so every
-  transfer must end on a short packet: FLAG_SEND_ZLP.
+- Transmit batches packets into one URB, up to 32 KiB. A batch goes
+  when the stack has nothing more queued and no transfer is in flight.
+  Behind a transfer in flight it waits up to 100 us for more, sent
+  from an hrtimer as cdc_ncm does. When byte queue limits or usbnet's
+  URB count stop the queue mid-burst, the qdisc hands the rest back
+  one packet at a time, each without xmit_more; sending on that alone
+  degrades to one URB per packet.
+- The target's receive TRBs are 64 KiB, so every transfer must end on
+  a short packet: FLAG_SEND_ZLP.
 - The interface is raw IP, point to point and without ARP, as
   qmi_wwan's raw-IP mode does it.
 - usbnet's own ndo_change_mtu refuses an MTU that is a multiple of the
@@ -27,16 +33,22 @@ Written, with this changelog, by Claude Opus 5.5, an AI coding assistant,
 together with the dbc_net series it pairs with. Tested only in QEMU, with
 an emulation of DbC the assistant also wrote: enumeration and module
 autoload by product ID, MTUs up to 9000, ping and iperf3 both ways, cable
-unplug and DbC disable while the link is up. The tests ran an
-out-of-tree copy that differs only in allocating with kzalloc(); this
-patch was build-tested on 7.4-rc3.
+unplug and DbC disable while the link is up.
+
+On 7.4-rc3 in that emulation, host-to-target iperf3 at MTU 1500 went
+from 225-255 Mbit/s, with 95% of URBs carrying one packet, to
+1000-1130 Mbit/s, 19-30 KiB per URB, and ping under that load from
+17-21 ms to 2 ms. The tests ran an out-of-tree copy that differs only
+in allocating with kzalloc() and in keeping its own byte queue limits
+on kernels before 6.19, whose usbnet has none; this patch was
+build-tested on 7.4-rc3.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
  drivers/net/usb/Kconfig  |  13 ++
  drivers/net/usb/Makefile |   1 +
- drivers/net/usb/dbcnet.c | 296 +++++++++++++++++++++++++++++++++++++++
- 3 files changed, 310 insertions(+)
+ drivers/net/usb/dbcnet.c | 357 +++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 371 insertions(+)
  create mode 100644 drivers/net/usb/dbcnet.c
 
 diff --git a/drivers/net/usb/Kconfig b/drivers/net/usb/Kconfig
@@ -75,10 +87,10 @@ index 4964f7b..c12dc2a 100644
  obj-$(CONFIG_USB_RTL8153_ECM)	+= r8153_ecm.o
 diff --git a/drivers/net/usb/dbcnet.c b/drivers/net/usb/dbcnet.c
 new file mode 100644
-index 0000000..301090e
+index 0000000..41b77b0
 --- /dev/null
 +++ b/drivers/net/usb/dbcnet.c
-@@ -0,0 +1,296 @@
+@@ -0,0 +1,357 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * dbcnet - the debug host's end of a network link over the xHCI Debug
@@ -94,6 +106,7 @@ index 0000000..301090e
 + * short packet or a ZLP, which the target's large receive TRBs need to
 + * complete.
 + */
++#include <linux/hrtimer.h>
 +#include <linux/if_arp.h>
 +#include <linux/module.h>
 +#include <linux/netdevice.h>
@@ -114,8 +127,12 @@ index 0000000..301090e
 +#define DBCNET_RX_URB_SIZE	SZ_16K
 +/* Frames are collected into one transfer up to this size. */
 +#define DBCNET_TX_BATCH		SZ_32K
++/* How long a batch waits, behind transfers in flight, for more frames. */
++#define DBCNET_TX_HOLD_NS	(100 * NSEC_PER_USEC)
 +
 +struct dbcnet {
++	struct usbnet		*dev;
++
 +	/* Stream decoder state: */
 +	u8			hdr[DBCNET_HDR];
 +	unsigned int		hdr_len;
@@ -125,6 +142,7 @@ index 0000000..301090e
 +	/* The transfer being collected, under the netdev TX lock: */
 +	struct sk_buff		*tx_agg;
 +	unsigned int		tx_frames;
++	struct hrtimer		tx_timer;	/* sends a held batch */
 +};
 +
 +static void dbcnet_rx_reset(struct dbcnet *rx)
@@ -212,17 +230,27 @@ index 0000000..301090e
 +
 +/*
 + * One transfer per packet would cost the target a TRB completion each, so
-+ * packets are collected while the stack says more follow (GSO segments, a
-+ * backed-up qdisc) and go out together. FLAG_MULTI_PACKET makes usbnet
-+ * accept NULL as "collected".
++ * packets are collected and go out together. A batch goes when it is full,
++ * or when the stack has no more for now and the link is idle. While
++ * transfers are in flight, the link could not take it sooner anyway: it
++ * waits for more, up to DBCNET_TX_HOLD_NS. That matters when a queue limit
++ * (byte queue limits, usbnet's URB count) stops the queue mid-burst: the
++ * qdisc hands the rest back one packet at a time, each without xmit_more.
++ *
++ * FLAG_MULTI_PACKET makes usbnet accept NULL as "collected". The timer
++ * passes a NULL skb to send what is held.
 + */
 +static struct sk_buff *dbcnet_tx_fixup(struct usbnet *dev, struct sk_buff *skb,
 +				       gfp_t flags)
 +{
 +	struct dbcnet		*d = dev->driver_priv;
-+	unsigned int		len = skb->len;
 +	struct sk_buff		*agg = d->tx_agg;
++	unsigned int		len;
 +	u8			*p;
++
++	if (!skb)
++		goto send;
++	len = skb->len;
 +
 +	if (!agg) {
 +		/* Room for a full batch and one more frame. */
@@ -250,11 +278,20 @@ index 0000000..301090e
 +	dev->net->stats.tx_dropped++;
 +	dev_kfree_skb_any(skb);
 +flush:
-+	if (!d->tx_agg || (netdev_xmit_more() && d->tx_agg->len < DBCNET_TX_BATCH))
++	if (!d->tx_agg)
 +		return NULL;
-+
++	if (d->tx_agg->len < DBCNET_TX_BATCH &&
++	    (netdev_xmit_more() || skb_queue_len_lockless(&dev->txq))) {
++		if (!hrtimer_is_queued(&d->tx_timer))
++			hrtimer_start(&d->tx_timer, DBCNET_TX_HOLD_NS,
++				      HRTIMER_MODE_REL_SOFT);
++		return NULL;
++	}
++send:
 +	agg = d->tx_agg;
 +	d->tx_agg = NULL;
++	if (!agg)
++		return NULL;
 +	if (!d->tx_frames) {
 +		dev_kfree_skb_any(agg);
 +		return NULL;
@@ -265,11 +302,42 @@ index 0000000..301090e
 +	return agg;
 +}
 +
++static enum hrtimer_restart dbcnet_tx_timer(struct hrtimer *t)
++{
++	struct dbcnet		*d = container_of(t, struct dbcnet, tx_timer);
++	struct net_device	*net = d->dev->net;
++
++	netif_tx_lock(net);
++	if (d->tx_agg) {
++		/*
++		 * A stopped queue would drop it: wait for the queue. A transmit
++		 * that ran while this waited for the lock may have rearmed us.
++		 */
++		if (!netif_xmit_stopped(netdev_get_tx_queue(net, 0)))
++			usbnet_start_xmit(NULL, net);
++		else if (!hrtimer_is_queued(t))
++			hrtimer_start(t, DBCNET_TX_HOLD_NS, HRTIMER_MODE_REL_SOFT);
++	}
++	netif_tx_unlock(net);
++
++	return HRTIMER_NORESTART;
++}
++
 +/* usbnet_open() calls this: URBs killed by a stop may have split a frame. */
 +static int dbcnet_reset(struct usbnet *dev)
 +{
 +	dbcnet_rx_reset(dev->driver_priv);
 +	dbcnet_tx_reset(dev->driver_priv);
++	return 0;
++}
++
++/* usbnet_stop() calls this with the queue stopped, before killing URBs. */
++static int dbcnet_stop(struct usbnet *dev)
++{
++	struct dbcnet		*d = dev->driver_priv;
++
++	hrtimer_cancel(&d->tx_timer);
++	dbcnet_tx_reset(d);
 +	return 0;
 +}
 +
@@ -312,6 +380,9 @@ index 0000000..301090e
 +	d = kzalloc_obj(*d);
 +	if (!d)
 +		return -ENOMEM;
++	d->dev = dev;
++	hrtimer_setup(&d->tx_timer, dbcnet_tx_timer, CLOCK_MONOTONIC,
++		      HRTIMER_MODE_REL_SOFT);
 +	dev->driver_priv = d;
 +
 +	/* Raw IP on a point-to-point link: no link-layer header at all. */
@@ -336,6 +407,7 @@ index 0000000..301090e
 +	struct dbcnet	*rx = dev->driver_priv;
 +
 +	if (rx) {
++		hrtimer_cancel(&rx->tx_timer);
 +		dbcnet_rx_reset(rx);
 +		dbcnet_tx_reset(rx);
 +		kfree(rx);
@@ -350,6 +422,7 @@ index 0000000..301090e
 +	.bind		= dbcnet_bind,
 +	.unbind		= dbcnet_unbind,
 +	.reset		= dbcnet_reset,
++	.stop		= dbcnet_stop,
 +	.rx_fixup	= dbcnet_rx_fixup,
 +	.tx_fixup	= dbcnet_tx_fixup,
 +};
@@ -375,8 +448,6 @@ index 0000000..301090e
 +
 +MODULE_DESCRIPTION("Network link to a Linux target over the xHCI Debug Capability");
 +MODULE_LICENSE("GPL");
-base-commit: aebb7274476403040d582c61478df8f4a7bf9cd3
-
 -- 
 2.56.0
 

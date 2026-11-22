@@ -13,6 +13,7 @@
  * short packet or a ZLP, which the target's large receive TRBs need to
  * complete.
  */
+#include <linux/hrtimer.h>
 #include <linux/if_arp.h>
 #include <linux/module.h>
 #include <linux/netdevice.h>
@@ -21,6 +22,15 @@
 #include <linux/usb.h>
 #include <linux/usb/usbnet.h>
 #include <linux/unaligned.h>
+#include <linux/version.h>
+
+/*
+ * usbnet keeps byte queue limits from 6.19 on (commit 7ff14c52049e).
+ * Before that, account for the transfers here, as usbnet would.
+ */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 19, 0)
+#define DBCNET_OWN_BQL
+#endif
 
 #define DBCNET_VID		0x1d6b
 #define DBCNET_PID		0x0012
@@ -33,8 +43,12 @@
 #define DBCNET_RX_URB_SIZE	SZ_16K
 /* Frames are collected into one transfer up to this size. */
 #define DBCNET_TX_BATCH		SZ_32K
+/* How long a batch waits, behind transfers in flight, for more frames. */
+#define DBCNET_TX_HOLD_NS	(100 * NSEC_PER_USEC)
 
 struct dbcnet {
+	struct usbnet		*dev;
+
 	/* Stream decoder state: */
 	u8			hdr[DBCNET_HDR];
 	unsigned int		hdr_len;
@@ -44,6 +58,10 @@ struct dbcnet {
 	/* The transfer being collected, under the netdev TX lock: */
 	struct sk_buff		*tx_agg;
 	unsigned int		tx_frames;
+	struct hrtimer		tx_timer;	/* sends a held batch */
+#ifdef DBCNET_OWN_BQL
+	spinlock_t		bql_lock;	/* serializes completions */
+#endif
 };
 
 static void dbcnet_rx_reset(struct dbcnet *rx)
@@ -129,19 +147,53 @@ static int dbcnet_rx_fixup(struct usbnet *dev, struct sk_buff *in)
 	return 1;
 }
 
+#ifdef DBCNET_OWN_BQL
+static void dbcnet_tx_done(struct sk_buff *skb)
+{
+	struct usbnet		*dev = netdev_priv(skb->dev);
+	struct dbcnet		*d = dev->driver_priv;
+	unsigned long		flags;
+
+	spin_lock_irqsave(&d->bql_lock, flags);
+	netdev_completed_queue(skb->dev, 1, skb->len);
+	spin_unlock_irqrestore(&d->bql_lock, flags);
+}
+
+static void dbcnet_bql_sent(struct usbnet *dev, struct sk_buff *agg)
+{
+	agg->dev = dev->net;
+	agg->destructor = dbcnet_tx_done;
+	netdev_sent_queue(dev->net, agg->len);
+}
+#else
+static void dbcnet_bql_sent(struct usbnet *dev, struct sk_buff *agg)
+{
+}
+#endif
+
 /*
  * One transfer per packet would cost the target a TRB completion each, so
- * packets are collected while the stack says more follow (GSO segments, a
- * backed-up qdisc) and go out together. FLAG_MULTI_PACKET makes usbnet
- * accept NULL as "collected".
+ * packets are collected and go out together. A batch goes when it is full,
+ * or when the stack has no more for now and the link is idle. While
+ * transfers are in flight, the link could not take it sooner anyway: it
+ * waits for more, up to DBCNET_TX_HOLD_NS. That matters when a queue limit
+ * (byte queue limits, usbnet's URB count) stops the queue mid-burst: the
+ * qdisc hands the rest back one packet at a time, each without xmit_more.
+ *
+ * FLAG_MULTI_PACKET makes usbnet accept NULL as "collected". The timer
+ * passes a NULL skb to send what is held.
  */
 static struct sk_buff *dbcnet_tx_fixup(struct usbnet *dev, struct sk_buff *skb,
 				       gfp_t flags)
 {
 	struct dbcnet		*d = dev->driver_priv;
-	unsigned int		len = skb->len;
 	struct sk_buff		*agg = d->tx_agg;
+	unsigned int		len;
 	u8			*p;
+
+	if (!skb)
+		goto send;
+	len = skb->len;
 
 	if (!agg) {
 		/* Room for a full batch and one more frame. */
@@ -169,19 +221,50 @@ drop:
 	dev->net->stats.tx_dropped++;
 	dev_kfree_skb_any(skb);
 flush:
-	if (!d->tx_agg || (netdev_xmit_more() && d->tx_agg->len < DBCNET_TX_BATCH))
+	if (!d->tx_agg)
 		return NULL;
-
+	if (d->tx_agg->len < DBCNET_TX_BATCH &&
+	    (netdev_xmit_more() || skb_queue_len_lockless(&dev->txq))) {
+		if (!hrtimer_is_queued(&d->tx_timer))
+			hrtimer_start(&d->tx_timer, DBCNET_TX_HOLD_NS,
+				      HRTIMER_MODE_REL_SOFT);
+		return NULL;
+	}
+send:
 	agg = d->tx_agg;
 	d->tx_agg = NULL;
+	if (!agg)
+		return NULL;
 	if (!d->tx_frames) {
 		dev_kfree_skb_any(agg);
 		return NULL;
 	}
 	/* Count the IP packets, not our headers. */
 	usbnet_set_skb_tx_stats(agg, d->tx_frames, -(long)(d->tx_frames * DBCNET_HDR));
+	dbcnet_bql_sent(dev, agg);
 
 	return agg;
+}
+
+static enum hrtimer_restart dbcnet_tx_timer(struct hrtimer *t)
+{
+	struct dbcnet		*d = container_of(t, struct dbcnet, tx_timer);
+	struct net_device	*net = d->dev->net;
+
+	netif_tx_lock(net);
+	if (d->tx_agg) {
+		/*
+		 * A stopped queue would drop it: wait for the queue. A transmit
+		 * that ran while this waited for the lock may have rearmed us.
+		 */
+		if (!netif_xmit_stopped(netdev_get_tx_queue(net, 0)))
+			usbnet_start_xmit(NULL, net);
+		else if (!hrtimer_is_queued(t))
+			hrtimer_start(t, DBCNET_TX_HOLD_NS, HRTIMER_MODE_REL_SOFT);
+	}
+	netif_tx_unlock(net);
+
+	return HRTIMER_NORESTART;
 }
 
 /* usbnet_open() calls this: URBs killed by a stop may have split a frame. */
@@ -189,6 +272,20 @@ static int dbcnet_reset(struct usbnet *dev)
 {
 	dbcnet_rx_reset(dev->driver_priv);
 	dbcnet_tx_reset(dev->driver_priv);
+#ifdef DBCNET_OWN_BQL
+	/* The stop before waited for every transfer. */
+	netdev_reset_queue(dev->net);
+#endif
+	return 0;
+}
+
+/* usbnet_stop() calls this with the queue stopped, before killing URBs. */
+static int dbcnet_stop(struct usbnet *dev)
+{
+	struct dbcnet		*d = dev->driver_priv;
+
+	hrtimer_cancel(&d->tx_timer);
+	dbcnet_tx_reset(d);
 	return 0;
 }
 
@@ -221,15 +318,23 @@ static const struct net_device_ops dbcnet_netdev_ops = {
 static int dbcnet_bind(struct usbnet *dev, struct usb_interface *intf)
 {
 	struct net_device	*net = dev->net;
+	struct dbcnet		*d;
 	int			ret;
 
 	ret = usbnet_get_endpoints(dev, intf);
 	if (ret)
 		return ret;
 
-	dev->driver_priv = kzalloc(sizeof(struct dbcnet), GFP_KERNEL);
-	if (!dev->driver_priv)
+	d = kzalloc(sizeof(struct dbcnet), GFP_KERNEL);
+	if (!d)
 		return -ENOMEM;
+	d->dev = dev;
+	hrtimer_setup(&d->tx_timer, dbcnet_tx_timer, CLOCK_MONOTONIC,
+		      HRTIMER_MODE_REL_SOFT);
+#ifdef DBCNET_OWN_BQL
+	spin_lock_init(&d->bql_lock);
+#endif
+	dev->driver_priv = d;
 
 	/* Raw IP on a point-to-point link: no link-layer header at all. */
 	net->netdev_ops = &dbcnet_netdev_ops;
@@ -253,6 +358,7 @@ static void dbcnet_unbind(struct usbnet *dev, struct usb_interface *intf)
 	struct dbcnet	*rx = dev->driver_priv;
 
 	if (rx) {
+		hrtimer_cancel(&rx->tx_timer);
 		dbcnet_rx_reset(rx);
 		dbcnet_tx_reset(rx);
 		kfree(rx);
@@ -267,6 +373,7 @@ static const struct driver_info dbcnet_info = {
 	.bind		= dbcnet_bind,
 	.unbind		= dbcnet_unbind,
 	.reset		= dbcnet_reset,
+	.stop		= dbcnet_stop,
 	.rx_fixup	= dbcnet_rx_fixup,
 	.tx_fixup	= dbcnet_tx_fixup,
 };

@@ -161,6 +161,20 @@ So the first packet after an idle spell can wait up to 64 ms. The tests set
   to 32 KiB, and go out as one URB. `FLAG_SEND_ZLP` ends exact multiples.
   - Without batching, every packet was its own transfer and cost the target
     a TRB completion. Host → target at MTU 1500 was then 93 Mb/s.
+  - `xmit_more` alone is not enough. When a queue limit stops the queue in
+    the middle of a burst, the qdisc requeues the rest and hands it back one
+    packet at a time, each without `xmit_more`. The limit can be byte queue
+    limits, which usbnet keeps from 6.19 on, or usbnet's URB count. On
+    7.4-rc3, 95% of URBs then carried one packet, and host → target at MTU
+    1500 fell to 225–255 Mb/s.
+  - So while URBs are in flight, a batch waits for more for up to 100 µs,
+    and an hrtimer sends what is held, as `cdc_ncm` does. On an idle link a
+    packet still goes at once. Host → target at MTU 1500 is now about
+    1100 Mb/s on both kernels, with ping under that load at 2–3 ms.
+  - Before 6.19, `dbcnet` keeps byte queue limits itself. Each sent URB is
+    counted, and its skb destructor completes it. Without them, usbnet's
+    URB queue (50 URBs at MTU 9000, 300 at MTU 1500) held ping under load
+    at 13–33 ms.
 - **MTU:** usbnet refuses an MTU that is a multiple of the packet size, so
   that a full-size frame needs no ZLP. That rule does nothing here, since
   every frame carries a header and the ZLP is sent anyway. `dbcnet` uses its
