@@ -216,7 +216,10 @@ testers.runNixOSTest {
           wait("ping -c 1 -W 1 10.77.0.1")
           for frame in (1024, 4096, 9004):
               ping("", "10.77.0.1", frame)
-          machine.fail("dmesg | rg -q 'BUG:|WARNING:'")
+          # Not `dmesg | rg -q` under machine.fail(): with pipefail, a match
+          # closes the pipe, dmesg exits 1, and the check passes.
+          kmsg = machine.succeed("dmesg")
+          assert "BUG:" not in kmsg and "WARNING:" not in kmsg, kmsg
 
       # The userspace debug host, for hosts without dbcnet.ko.
       with subtest("dbcnet-host drives the same target from userspace"):
