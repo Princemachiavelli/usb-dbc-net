@@ -28,7 +28,7 @@ programmed.
       controller has dbc=on. The debug host's controller cannot migrate
       the transfers it had in flight to the cable, so after loading, the
       cable is unplugged and plugged back in, as usb-host does with its
-      device; a partly done transfer is given up, as on hardware.
+      device; a partly done transfer is given up with the unplug.
   3/5 splits the xHCI qtest's start-up so a test can set up a second
       controller before the first runs; no change to existing tests.
   4/5 qtests: transfers both ways, disable/enable, and migration.

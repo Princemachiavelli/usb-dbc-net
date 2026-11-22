@@ -55,8 +55,8 @@ include or derive from AI-generated content, naming Claude, and the cover
 letter says so first. It is ready should that policy change, or as a
 reference for a human's own implementation. It is based on the 11.1.2
 release tarball and would need a rebase onto qemu.git master. To run its
-qtests, build QEMU from that branch and run
-`tests/qtest/usb-hcd-xhci-test -p /x86_64/xhci/pci/dbc`.
+qtests, build QEMU from that branch, then in the build directory run
+`QTEST_QEMU_BINARY=./qemu-system-x86_64 ./tests/qtest/usb-hcd-xhci-test -p /x86_64/xhci/pci/dbc`.
 
 The kernel's rules for AI-assisted patches are in 7.4-rc3's
 `Documentation/process/coding-assistants.rst` and `generated-content.rst`.

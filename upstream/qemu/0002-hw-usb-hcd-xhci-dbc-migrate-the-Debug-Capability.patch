@@ -12,8 +12,8 @@ flight to usb-dbc-peer, and moves its rings past them. So, as usb-host
 does with its device, the peer unplugs the cable after loading and
 plugs it back in 100 ms later. The guest sees DbC stay enabled, a
 disconnect and a connect, and the debug host enumerates the cable again.
-A TRB that was partly transferred is given up with the unplug, as on
-real hardware, and never completes; the guest's driver requeues.
+A TRB that was partly transferred is given up with the unplug, as a
+real unplug would, and never completes; the guest's driver requeues.
 
 The peer's speed is not migrated, and the debug host's controller needs
 it to find the port to detach, so post_load picks it as attaching does.
