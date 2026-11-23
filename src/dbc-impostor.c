@@ -28,6 +28,7 @@
 #define EP_OUT_ADDR (USB_DIR_OUT | 1)
 #define EP_IN_ADDR (USB_DIR_IN | 1)
 #define SS_MAXPACKET 1024
+#define HS_MAXPACKET 512
 #define EP0_MAX 512
 
 /* DbC's defaults (drivers/usb/host/xhci-dbgcap.h). */
@@ -38,6 +39,12 @@ static const char *opt_tun = "dbc0";
 static const char *opt_udc_driver = "dummy_udc";
 static const char *opt_udc_device = "dummy_udc.0";
 static bool opt_zlp = true;
+static bool opt_high_speed;
+
+static uint16_t bulk_maxpacket(void)
+{
+	return opt_high_speed ? HS_MAXPACKET : SS_MAXPACKET;
+}
 
 static const char *const strings[] = {
 	NULL, "Linux Foundation", "Linux USB Debug Target", "0001",
@@ -60,8 +67,8 @@ static struct usb_device_descriptor device_desc(void)
 	return (struct usb_device_descriptor){
 		.bLength = USB_DT_DEVICE_SIZE,
 		.bDescriptorType = USB_DT_DEVICE,
-		.bcdUSB = htole16(0x0300),
-		.bMaxPacketSize0 = 9, /* 2^9 = 512, SuperSpeed */
+		.bcdUSB = htole16(opt_high_speed ? 0x0200 : 0x0300),
+		.bMaxPacketSize0 = opt_high_speed ? 64 : 9, /* SuperSpeed: 2^9 */
 		.idVendor = htole16(opt_vid),
 		.idProduct = htole16(opt_pid),
 		.bcdDevice = htole16(0x0010),
@@ -96,14 +103,14 @@ static size_t config_desc(uint8_t *out)
 			.bDescriptorType = USB_DT_ENDPOINT,
 			.bEndpointAddress = EP_OUT_ADDR,
 			.bmAttributes = USB_ENDPOINT_XFER_BULK,
-			.wMaxPacketSize = htole16(SS_MAXPACKET),
+			.wMaxPacketSize = htole16(bulk_maxpacket()),
 		},
 		{
 			.bLength = USB_DT_ENDPOINT_SIZE,
 			.bDescriptorType = USB_DT_ENDPOINT,
 			.bEndpointAddress = EP_IN_ADDR,
 			.bmAttributes = USB_ENDPOINT_XFER_BULK,
-			.wMaxPacketSize = htole16(SS_MAXPACKET),
+			.wMaxPacketSize = htole16(bulk_maxpacket()),
 		},
 	};
 	struct usb_ss_ep_comp_descriptor comp = {
@@ -119,6 +126,8 @@ static size_t config_desc(uint8_t *out)
 	for (int i = 0; i < 2; i++) {
 		memcpy(out + n, &eps[i], USB_DT_ENDPOINT_SIZE);
 		n += USB_DT_ENDPOINT_SIZE;
+		if (opt_high_speed)
+			continue;
 		memcpy(out + n, &comp, USB_DT_SS_EP_COMP_SIZE);
 		n += USB_DT_SS_EP_COMP_SIZE;
 	}
@@ -217,7 +226,7 @@ static int ep_enable(uint8_t addr)
 		.bDescriptorType = USB_DT_ENDPOINT,
 		.bEndpointAddress = addr,
 		.bmAttributes = USB_ENDPOINT_XFER_BULK,
-		.wMaxPacketSize = htole16(SS_MAXPACKET),
+		.wMaxPacketSize = htole16(bulk_maxpacket()),
 	};
 	int h = ioctl(fd, USB_RAW_IOCTL_EP_ENABLE, &d);
 	if (h < 0)
@@ -319,7 +328,7 @@ static void handle_standard(const struct usb_ctrlrequest *c)
 			n = config_desc(buf);
 			break;
 		case USB_DT_BOS:
-			n = bos_desc(buf);
+			n = opt_high_speed ? 0 : bos_desc(buf);
 			break;
 		case USB_DT_STRING:
 			n = string_desc(value & 0xff, buf);
@@ -395,7 +404,8 @@ static void usage(void)
 	fprintf(stderr,
 		"usage: dbc-impostor [--tun NAME] [--vid HEX] [--pid HEX]\n"
 		"                    [--protocol N] [--udc-driver NAME]\n"
-		"                    [--udc-device NAME] [--no-zlp]\n");
+		"                    [--udc-device NAME] [--no-zlp]\n"
+		"                    [--speed high|super]\n");
 	exit(EXIT_FAILURE);
 }
 
@@ -409,6 +419,7 @@ int main(int argc, char **argv)
 		{ "udc-driver", required_argument, NULL, 'D' },
 		{ "udc-device", required_argument, NULL, 'd' },
 		{ "no-zlp", no_argument, NULL, 'z' },
+		{ "speed", required_argument, NULL, 's' },
 		{ 0 },
 	};
 	int o;
@@ -421,6 +432,12 @@ int main(int argc, char **argv)
 		case 'D': opt_udc_driver = optarg; break;
 		case 'd': opt_udc_device = optarg; break;
 		case 'z': opt_zlp = false; break;
+		case 's':
+			if (!strcmp(optarg, "high"))
+				opt_high_speed = true;
+			else if (strcmp(optarg, "super"))
+				usage();
+			break;
 		default: usage();
 		}
 	}
@@ -432,7 +449,9 @@ int main(int argc, char **argv)
 	fd = open("/dev/raw-gadget", O_RDWR | O_CLOEXEC);
 	if (fd < 0)
 		die("open /dev/raw-gadget");
-	struct usb_raw_init init = { .speed = USB_SPEED_SUPER };
+	struct usb_raw_init init = {
+		.speed = opt_high_speed ? USB_SPEED_HIGH : USB_SPEED_SUPER,
+	};
 	strncpy((char *)init.driver_name, opt_udc_driver, UDC_NAME_LENGTH_MAX - 1);
 	strncpy((char *)init.device_name, opt_udc_device, UDC_NAME_LENGTH_MAX - 1);
 	if (ioctl(fd, USB_RAW_IOCTL_INIT, &init) < 0)
