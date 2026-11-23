@@ -40,6 +40,7 @@ static const char *opt_udc_driver = "dummy_udc";
 static const char *opt_udc_device = "dummy_udc.0";
 static bool opt_zlp = true;
 static bool opt_high_speed;
+static bool opt_udc_acks_status;
 
 static uint16_t bulk_maxpacket(void)
 {
@@ -298,7 +299,8 @@ static void set_configuration(uint16_t value)
 		die("vbus draw");
 	if (ioctl(fd, USB_RAW_IOCTL_CONFIGURE, 0) < 0)
 		die("configure");
-	ep0_read(0);
+	if (!opt_udc_acks_status)
+		ep0_read(0);
 	if (value == 1 && !atomic_exchange(&data_started, true)) {
 		pthread_t t;
 		pthread_create(&t, NULL, out_thread, NULL);
@@ -405,7 +407,7 @@ static void usage(void)
 		"usage: dbc-impostor [--tun NAME] [--vid HEX] [--pid HEX]\n"
 		"                    [--protocol N] [--udc-driver NAME]\n"
 		"                    [--udc-device NAME] [--no-zlp]\n"
-		"                    [--speed high|super]\n");
+		"                    [--speed high|super] [--udc-acks-status]\n");
 	exit(EXIT_FAILURE);
 }
 
@@ -420,6 +422,7 @@ int main(int argc, char **argv)
 		{ "udc-device", required_argument, NULL, 'd' },
 		{ "no-zlp", no_argument, NULL, 'z' },
 		{ "speed", required_argument, NULL, 's' },
+		{ "udc-acks-status", no_argument, NULL, 'a' },
 		{ 0 },
 	};
 	int o;
@@ -432,6 +435,7 @@ int main(int argc, char **argv)
 		case 'D': opt_udc_driver = optarg; break;
 		case 'd': opt_udc_device = optarg; break;
 		case 'z': opt_zlp = false; break;
+		case 'a': opt_udc_acks_status = true; break;
 		case 's':
 			if (!strcmp(optarg, "high"))
 				opt_high_speed = true;
