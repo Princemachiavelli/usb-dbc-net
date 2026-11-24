@@ -13,16 +13,23 @@
  * short packet or a ZLP, which the target's large receive TRBs need to
  * complete.
  */
+#include <linux/ethtool.h>
 #include <linux/hrtimer.h>
 #include <linux/if_arp.h>
+#include <linux/mii.h>
 #include <linux/module.h>
 #include <linux/netdevice.h>
 #include <linux/skbuff.h>
 #include <linux/slab.h>
 #include <linux/usb.h>
 #include <linux/usb/usbnet.h>
-#include <linux/unaligned.h>
 #include <linux/version.h>
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+#include <linux/unaligned.h>
+#else
+#include <asm/unaligned.h>
+#endif
 
 /*
  * usbnet keeps byte queue limits from 6.19 on (commit 7ff14c52049e).
@@ -30,6 +37,15 @@
  */
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 19, 0)
 #define DBCNET_OWN_BQL
+#endif
+
+/*
+ * Newer usbnet clamps max_mtu to the hard MTU unless the driver sets this
+ * flag. Kernels without the flag (up to 6.18 mainline, and the 5.10 to 6.6
+ * LTS branches) have no clamp, so the empty value is right for them.
+ */
+#ifndef FLAG_NOMAXMTU
+#define FLAG_NOMAXMTU		0
 #endif
 
 #define DBCNET_VID		0x1d6b
@@ -329,8 +345,13 @@ static int dbcnet_bind(struct usbnet *dev, struct usb_interface *intf)
 	if (!d)
 		return -ENOMEM;
 	d->dev = dev;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
 	hrtimer_setup(&d->tx_timer, dbcnet_tx_timer, CLOCK_MONOTONIC,
 		      HRTIMER_MODE_REL_SOFT);
+#else
+	hrtimer_init(&d->tx_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL_SOFT);
+	d->tx_timer.function = dbcnet_tx_timer;
+#endif
 #ifdef DBCNET_OWN_BQL
 	spin_lock_init(&d->bql_lock);
 #endif
